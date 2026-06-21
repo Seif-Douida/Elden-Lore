@@ -1,0 +1,51 @@
+[project]
+name = "elden-ring-rag"
+version = "0.1.0"
+description = "RAG chatbot for Elden Ring lore, items, quests, and bosses"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    # --- Data pipeline ---
+    "httpx>=0.28",               # async HTTP for wiki scraping
+    "beautifulsoup4>=4.13",      # HTML parsing
+    "lxml>=5.3",                 # fast BS4 parser backend
+    "youtube-transcript-api>=1.0",
+    "yt-dlp>=2025.1",
+
+    # --- NLP / chunking ---
+    "spacy>=3.8",                # NER + entity ruler
+    "langchain>=0.3",
+    "langchain-community>=0.3",
+    "langchain-qdrant>=0.2",
+
+    # --- Embeddings ---
+    "sentence-transformers>=3.4",
+    "torch>=2.5",                # CPU-only — see note below
+
+    # --- Vector DB ---
+    "qdrant-client>=1.13",
+
+    # --- Utils ---
+    "python-dotenv>=1.0",
+    "tenacity>=9.0",             # retry logic for scraping
+    "tqdm>=4.67",                # progress bars
+    "rich>=13.9",                # better console output
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.9",                 # linter + formatter
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "ipykernel>=6.29",           # notebook support for exploration
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

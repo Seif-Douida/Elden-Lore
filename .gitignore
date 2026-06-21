@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+qdrant_storage
+data_pipeline/data/cache
+data_pipeline/data/pages.jsonl
+__init__.py
+.env
+
