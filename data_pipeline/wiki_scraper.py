@@ -166,14 +166,23 @@ SKIP_PATHS: frozenset[str] = frozenset({
 
 SKIP_URL_FRAGMENTS: tuple[str, ...] = (
     "action=",
-    "fextralife.com/Shop",
-    "fextralife.com/forums",
-    "fextralife.com/news",
-    "fextralife.com/blog",
-    "wiki.fextralife.com",   # cross-wiki links
+    "/Shop",
+    "/forums",
+    "/news",
+    "/blog",
     "?",
     "#",
 )
+
+# Domains that are NOT the Elden Ring wiki (other fextralife wikis, etc.)
+# Checked against parsed.netloc, not the full URL string
+SKIP_DOMAINS: frozenset[str] = frozenset({
+    "fextralife.com",                    # root domain (shop, forums, blog)
+    "darksouls3.wiki.fextralife.com",
+    "darksouls.wiki.fextralife.com",
+    "bloodborne.wiki.fextralife.com",
+    "sekiro.wiki.fextralife.com",
+})
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -243,15 +252,20 @@ async def fetch(
     url: str,
     sem: asyncio.Semaphore,
     last_t: list[float],
+    verbose: bool = False,
 ) -> str:
     """Fetch URL with caching and rate limiting."""
     cached = _read_cache(url)
     if cached:
+        if verbose:
+            console.print(f"  [dim][cache][/dim] {url}")
         return cached
     async with sem:
         elapsed = time.monotonic() - last_t[0]
         if elapsed < RATE_LIMIT:
             await asyncio.sleep(RATE_LIMIT - elapsed)
+        if verbose:
+            console.print(f"  [cyan][fetch][/cyan] {url}")
         html = await _fetch(client, url)
         last_t[0] = time.monotonic()
     _write_cache(url, html)
@@ -280,16 +294,33 @@ def is_wiki_page(url: str) -> bool:
     if not url:
         return False
     parsed = urlparse(url)
-    # Must be on the Elden Ring fextralife subdomain
-    if "eldenring.wiki.fextralife.com" not in parsed.netloc:
+
+    # Must be exactly the Elden Ring wiki subdomain
+    if parsed.netloc != "eldenring.wiki.fextralife.com":
         return False
+
+    # Reject other fextralife wikis that might appear as cross-links
+    if parsed.netloc in SKIP_DOMAINS:
+        return False
+
     path = parsed.path.rstrip("/")
     if not path or path == "/Elden+Ring+Wiki":
         return False
     if path in SKIP_PATHS:
         return False
+
+    # Reject image/file URLs (e.g. /file/Elden-Ring/radagon...jpg)
+    if path.startswith("/file/") or path.lower().endswith(
+        (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico", ".pdf")
+    ):
+        return False
+
+    # Reject query strings, fragments, and specific path substrings
+    if parsed.query:
+        return False
     if any(frag in url for frag in SKIP_URL_FRAGMENTS):
         return False
+
     return True
 
 
@@ -297,51 +328,72 @@ def is_wiki_page(url: str) -> bool:
 
 def extract_breadcrumb(soup: BeautifulSoup) -> list[str]:
     """
-    Extract the breadcrumb trail from the confirmed selector:
-        <div id="breadcrumbs-container"> ... <a>Segment</a> ... </div>
+    Extract the breadcrumb trail from:
+        <div id="breadcrumbs-container">
+          <a href="...">World Information</a>
+          <a href="...">Locations</a>
+          <!-- hidden editor button: <div id="breadcrumbs-bcontainer">
+                 <a href="#" id="btnCreateBreadcrumb">+</a>
+               </div> -->
+        </div>
 
-    Returns a list of segment strings, e.g.:
-        ["World Information", "Locations", "Caelid"]
-
-    Returns [] if no breadcrumb is found (entry-point hub pages often have none).
+    Returns e.g. ["World Information", "Locations", "Caelid"].
+    Returns [] if no real breadcrumb segments exist (entry-point hub pages).
     """
     container = soup.find(id="breadcrumbs-container")
     if not container:
         return []
 
+    # The hidden editor sub-div must be excluded — it contains the '+' button
+    editor_div = container.find(id="breadcrumbs-bcontainer")
+    if editor_div:
+        editor_div.decompose()
+
     segments: list[str] = []
     for a in container.find_all("a"):
+        href = a.get("href", "")
         text = a.get_text(strip=True)
-        if text and text not in ("", "Elden Ring Wiki"):
-            segments.append(text)
 
-    # Also include any plain text segments (some breadcrumbs use spans, not just <a>)
-    if not segments:
-        for el in container.find_all(["a", "span", "li"]):
-            text = el.get_text(strip=True)
-            if text and text not in ("", "Elden Ring Wiki", ">", "/", "»"):
-                segments.append(text)
+        # Skip: empty text, the wiki home link, anchor-only links (#), symbol-only
+        if not text:
+            continue
+        if text in ("Elden Ring Wiki", ">", "/", "»", "+"):
+            continue
+        if href == "#" or href == "":
+            continue
+        # Skip single punctuation / symbol segments
+        if len(text) <= 1:
+            continue
+
+        segments.append(text)
 
     return segments
 
 
 def breadcrumb_extends(parent: list[str], child: list[str]) -> bool:
     """
-    Return True if child breadcrumb is a direct extension of parent breadcrumb.
+    Return True if the child belongs to the same wiki tree as the parent.
 
-    Examples:
-        parent = ["World Information", "Locations", "Caelid"]
-        child  = ["World Information", "Locations", "Caelid", "Sellia Crystal Tunnel"] → True
-        child  = ["World Information", "Locations", "Limgrave"]                        → False
-        child  = ["World Information", "Creatures & Enemies", "Radahn"]                → False
+    Rules:
+      1. parent is [] (entry point, no breadcrumb) → accept anything
+      2. child is []  (page has no breadcrumb set) → accept, but crawl_recursive
+                                                      will NOT recurse further
+      3. child[:len(parent)] == parent              → child is at the same level
+                                                      or deeper in the same tree → accept
+      4. anything else                              → different tree → reject
 
-    Special case: if parent is [] (entry-point hub with no breadcrumb),
-    we accept any child — the hub links are the entry into the tree.
+    Real-world examples with parent = ['World Information']:
+      child = []                                           → True  (no breadcrumb, accept once)
+      child = ['World Information']                        → True  (same level, still our tree)
+      child = ['World Information', 'Locations']           → True  (one level deeper)
+      child = ['World Information', 'Locations', 'Caelid'] → True  (two levels deeper)
+      child = ['Equipment & Magic', 'Weapons']             → False (different entry point)
+      child = ['Character Information']                    → False (different entry point)
     """
     if not parent:
         return True
-    if len(child) != len(parent) + 1:
-        return False
+    if not child:
+        return True   # no breadcrumb — accept but caller stops recursion
     return child[:len(parent)] == parent
 
 
@@ -594,24 +646,39 @@ def extract_body_text(soup: BeautifulSoup) -> str:
 
 def extract_content_links(soup: BeautifulSoup) -> list[str]:
     """
-    Extract all wiki content links from the page CONTENT area only.
-    Strips the nav first so nav links don't pollute the link set.
-    """
-    # Remove global nav before harvesting links
-    for nav in soup.select("nav, header, div#header, div.wiki-nav"):
-        nav.decompose()
+    Extract all wiki content links from the page content area only.
 
+    Targets div#wiki-content-block exclusively — this element never contains
+    the global nav bar, so we don't need to decompose anything.
+    Falls back to the full soup only if the content block is absent,
+    in which case we explicitly skip any <nav>/<header> descendants.
+    """
     seen: set[str] = set()
     links: list[str] = []
-    content = (
-        soup.select_one("div#wiki-content-block, div.wiki-content, article, main")
-        or soup
-    )
-    for a in content.find_all("a", href=True):
-        url = to_absolute(a["href"])
-        if url and is_wiki_page(url) and url not in seen:
-            seen.add(url)
-            links.append(url)
+
+    content = soup.select_one("div#wiki-content-block, div.wiki-content, article")
+
+    if content:
+        # Happy path: scoped to content block, no nav contamination possible
+        for a in content.find_all("a", href=True):
+            url = to_absolute(a["href"])
+            if url and is_wiki_page(url) and url not in seen:
+                seen.add(url)
+                links.append(url)
+    else:
+        # Fallback: full soup but skip links that live inside nav/header elements
+        nav_els = set()
+        for nav in soup.select("nav, header, div#header, div.wiki-nav, footer"):
+            nav_els.update(id(el) for el in nav.find_all("a"))
+
+        for a in soup.find_all("a", href=True):
+            if id(a) in nav_els:
+                continue
+            url = to_absolute(a["href"])
+            if url and is_wiki_page(url) and url not in seen:
+                seen.add(url)
+                links.append(url)
+
     return links
 
 
@@ -646,31 +713,45 @@ def parse_page(html: str, url: str, category: str) -> WikiPage:
 # ── Breadcrumb-recursive crawler ──────────────────────────────────────────────
 
 async def crawl_recursive(
-    client:       httpx.AsyncClient,
-    sem:          asyncio.Semaphore,
-    last_t:       list[float],
-    url:          str,
-    parent_crumb: list[str],
-    base_category: str,
-    discovered:   dict[str, str],   # url → category, shared across all calls
-    depth:        int = 0,
+    client:          httpx.AsyncClient,
+    sem:             asyncio.Semaphore,
+    last_t:          list[float],
+    url:             str,
+    required_prefix: list[str],
+    base_category:   str,
+    discovered:      dict[str, str],
+    limit:           Optional[int] = None,
+    verbose:         bool = False,
+    depth:           int = 0,
 ) -> None:
     """
-    Fetch `url`, record it in `discovered`, then recursively follow every
-    content link whose breadcrumb extends the current page's breadcrumb.
+    Fetch `url`, record it, then recursively follow content links whose
+    breadcrumb starts with `required_prefix`.
 
-    `parent_crumb` is the breadcrumb of the PAGE WE CAME FROM.
-    We fetch the current page, parse its breadcrumb, check it extends
-    the parent's, then use the current breadcrumb as the new parent_crumb
-    for its children.
+    `required_prefix` is fixed for the lifetime of a sub-tree crawl.
+    It is set to the breadcrumb of the FIRST real page we enter
+    (e.g. ['World Information', 'Locations']) and never changes.
+    This means every page in this crawl must belong to that sub-tree,
+    preventing cross-contamination from cross-wiki links.
+
+    Special cases:
+      - Page has no breadcrumb → accept and scrape, but do NOT recurse further
+        (we have no signal to know which of its links belong here)
+      - depth == 0 → this is the sub-tree root itself, always accept
     """
     if depth > MAX_DEPTH:
         return
-    if url in discovered:
-        return
+    # depth=0 is the sub-tree root, already recorded by discover_urls —
+    # skip the guard and go straight to harvesting its links.
+    if depth > 0:
+        if url in discovered:
+            return
+        if limit is not None and len(discovered) >= limit:
+            return
 
     try:
-        html = await fetch(client, url, sem, last_t)
+        # depth=0 root was already fetched and printed by discover_urls — suppress verbose
+        html = await fetch(client, url, sem, last_t, verbose=(verbose and depth > 0))
     except httpx.HTTPStatusError as e:
         if e.response.status_code != 404:
             console.print(f"  [yellow]HTTP {e.response.status_code}[/yellow] {url}")
@@ -679,24 +760,36 @@ async def crawl_recursive(
         console.print(f"  [red]Error[/red] fetching {url}: {e}")
         return
 
-    # Parse breadcrumb from the fetched page
     soup_for_crumb = BeautifulSoup(html, "lxml")
-    current_crumb = extract_breadcrumb(soup_for_crumb)
+    current_crumb  = extract_breadcrumb(soup_for_crumb)
 
-    # Check the breadcrumb contract:
-    # The current page's breadcrumb must extend the parent's.
-    # Exception: depth=0 means this IS the entry point — always accept.
-    if depth > 0 and not breadcrumb_extends(parent_crumb, current_crumb):
-        return
+    if depth > 0:
+        if not current_crumb:
+            # No breadcrumb — scrape it once, don't recurse
+            category = infer_category(required_prefix, base_category)
+            discovered[url] = category
+            if verbose:
+                console.print(f"  [dim][no-crumb, accepted once][/dim] {url}")
+            return
 
-    # Record this page
-    category = infer_category(current_crumb, base_category)
-    discovered[url] = category
+        # Must start with the required prefix for this sub-tree
+        if current_crumb[:len(required_prefix)] != required_prefix:
+            return
 
-    # Collect all content links from the page
+        # Record this page (depth=0 root was already recorded by discover_urls)
+        category = infer_category(current_crumb, base_category)
+        discovered[url] = category
+        if verbose:
+            crumb_str = " / ".join(current_crumb)
+            console.print(
+                f"  [#{len(discovered):04d}] [{category}] {url.split('/')[-1]}  "
+                f"[dim]{crumb_str}[/dim]"
+            )
+        if limit is not None and len(discovered) >= limit:
+            return
+
+    # Recurse into content links — required_prefix never changes
     content_links = extract_content_links(BeautifulSoup(html, "lxml"))
-
-    # Recurse into each link
     for child_url in content_links:
         if child_url not in discovered:
             await crawl_recursive(
@@ -704,9 +797,11 @@ async def crawl_recursive(
                 sem=sem,
                 last_t=last_t,
                 url=child_url,
-                parent_crumb=current_crumb,
+                required_prefix=required_prefix,
                 base_category=base_category,
                 discovered=discovered,
+                limit=limit,
+                verbose=verbose,
                 depth=depth + 1,
             )
 
@@ -714,13 +809,23 @@ async def crawl_recursive(
 # ── Discovery orchestrator ────────────────────────────────────────────────────
 
 async def discover_urls(
-    client: httpx.AsyncClient,
-    sem:    asyncio.Semaphore,
-    last_t: list[float],
-    entry:  Optional[str] = None,   # restrict to one entry point (for --entry flag)
+    client:  httpx.AsyncClient,
+    sem:     asyncio.Semaphore,
+    last_t:  list[float],
+    entry:   Optional[str] = None,
+    limit:   Optional[int] = None,
+    verbose: bool = False,
 ) -> dict[str, str]:
     """
-    Run breadcrumb-recursive crawl from all entry points.
+    For each entry point:
+      1. Fetch the entry point page and collect its direct content links.
+         These are the sub-tree roots (e.g. /Locations, /NPCs, /Bosses
+         under /World+Information).
+      2. For each sub-tree root, fetch it, read its breadcrumb, and launch
+         a dedicated crawl_recursive call pinned to THAT breadcrumb prefix.
+         This prevents the Locations crawl from following Bosses links and
+         the Bosses crawl from following item links.
+
     Returns {url: category_label}.
     """
     discovered: dict[str, str] = {}
@@ -730,33 +835,108 @@ async def discover_urls(
         entries = [(p, c) for p, c in ENTRY_POINTS if p == entry]
         if not entries:
             console.print(f"[red]Unknown entry point: {entry}[/red]")
-            console.print(f"Valid options: {[p for p,_ in ENTRY_POINTS]}")
+            console.print(f"Valid options: {[p for p, _ in ENTRY_POINTS]}")
             return {}
 
     for path, base_category in entries:
-        url = BASE_URL + path
+        entry_url = BASE_URL + path
         console.print(
-            f"\n[bold cyan]Crawling entry point:[/bold cyan] {path} "
+            f"\n[bold cyan]Entry point:[/bold cyan] {path} "
             f"(base category: {base_category})"
         )
-        before = len(discovered)
 
-        await crawl_recursive(
-            client=client,
-            sem=sem,
-            last_t=last_t,
-            url=url,
-            parent_crumb=[],      # entry points have no parent
-            base_category=base_category,
-            discovered=discovered,
-            depth=0,
+        # Step 1: fetch the entry point, collect its direct children
+        try:
+            entry_html = await fetch(client, entry_url, sem, last_t, verbose=verbose)
+        except Exception as e:
+            console.print(f"  [red]Failed to fetch entry point: {e}[/red]")
+            continue
+
+        # Record the entry point page itself
+        entry_soup = BeautifulSoup(entry_html, "lxml")
+        entry_crumb = extract_breadcrumb(entry_soup)
+        entry_category = infer_category(entry_crumb, base_category)
+        discovered[entry_url] = entry_category
+
+        direct_children = extract_content_links(BeautifulSoup(entry_html, "lxml"))
+        console.print(f"  Direct children found: {len(direct_children)}")
+
+        # Step 2: for each direct child, fetch it and pin a crawl to its breadcrumb
+        for child_url in direct_children:
+            if child_url in discovered:
+                continue
+
+            try:
+                child_html = await fetch(client, child_url, sem, last_t, verbose=verbose)
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code != 404:
+                    console.print(f"  [yellow]HTTP {e.response.status_code}[/yellow] {child_url}")
+                continue
+            except Exception:
+                continue
+
+            child_soup  = BeautifulSoup(child_html, "lxml")
+            child_crumb = extract_breadcrumb(child_soup)
+            child_title = extract_title(child_soup)
+
+            if not child_crumb:
+                # No breadcrumb — accept this page but don't recurse
+                child_cat = infer_category(entry_crumb, base_category)
+                discovered[child_url] = child_cat
+                if verbose:
+                    console.print(
+                        f"  [#{len(discovered):04d}] [{child_cat}] "
+                        f"{child_url.split('/')[-1]}  [dim](no breadcrumb, accepted once)[/dim]"
+                    )
+                if limit is not None and len(discovered) >= limit:
+                    return discovered
+                continue
+
+            # Build the required prefix as breadcrumb + this page's own title.
+            # e.g. /Locations has breadcrumb ['World Information'] and title 'Locations'
+            # → required_prefix = ['World Information', 'Locations']
+            # This means ONLY pages whose breadcrumb starts with
+            # ['World Information', 'Locations'] are accepted — not Bosses, NPCs etc.
+            required_prefix = child_crumb + [child_title]
+
+            child_cat = infer_category(required_prefix, base_category)
+            discovered[child_url] = child_cat
+
+            console.print(
+                f"  [green]→ sub-tree:[/green] {required_prefix} "
+                f"({child_cat}) — crawling..."
+            )
+
+            before = len(discovered)
+            await crawl_recursive(
+                client=client,
+                sem=sem,
+                last_t=last_t,
+                url=child_url,
+                required_prefix=required_prefix,
+                base_category=child_cat,
+                discovered=discovered,
+                limit=limit,
+                verbose=verbose,
+                depth=0,
+            )
+            if limit is not None and len(discovered) >= limit:
+                return discovered
+            added = len(discovered) - before
+            console.print(
+                f"    +{added} pages under {required_prefix}"
+            )
+
+        total_under_entry = sum(
+            1 for u in discovered
+            if u.startswith(BASE_URL)
         )
+        console.print(f"  Total so far: {total_under_entry} URLs")
 
-        added = len(discovered) - before
-        console.print(f"  → {added} URLs discovered under {path}")
-
-    # Summary
-    console.print(f"\n[bold green]Discovery complete:[/bold green] {len(discovered)} total URLs\n")
+    console.print(
+        f"\n[bold green]Discovery complete:[/bold green] "
+        f"{len(discovered)} total URLs\n"
+    )
     by_cat: dict[str, int] = defaultdict(int)
     for cat in discovered.values():
         by_cat[cat] += 1
@@ -772,6 +952,7 @@ async def scrape(
     limit:    Optional[int] = None,
     dry_run:  bool = False,
     entry:    Optional[str] = None,
+    verbose:  bool = False,
 ) -> None:
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -780,7 +961,7 @@ async def scrape(
     last_t = [0.0]
 
     async with build_client() as client:
-        url_map = await discover_urls(client, sem, last_t, entry=entry)
+        url_map = await discover_urls(client, sem, last_t, entry=entry, limit=limit, verbose=verbose)
 
         urls = list(url_map.items())
         if limit:
@@ -836,14 +1017,22 @@ async def scrape(
                     if url in already:
                         continue
                     try:
-                        html = await fetch(client, url, sem, last_t)
+                        html = await fetch(client, url, sem, last_t, verbose=verbose)
                         page = parse_page(html, url, category)
                         if len(page.body_text) < 80:
+                            if verbose:
+                                console.print(f"  [yellow][skip — too short][/yellow] {url.split('/')[-1]}")
                             continue
                         out_f.write(
                             json.dumps(page.to_dict(), ensure_ascii=False) + "\n"
                         )
                         out_f.flush()
+                        if verbose:
+                            crumb_str = " / ".join(page.breadcrumb) if page.breadcrumb else "no breadcrumb"
+                            console.print(
+                                f"  [green][scraped][/green] {page.title[:50]}  "
+                                f"[dim][{category}] {crumb_str}[/dim]"
+                            )
                     except httpx.HTTPStatusError as e:
                         if e.response.status_code != 404:
                             errors.append((url, f"HTTP {e.response.status_code}"))
@@ -882,8 +1071,17 @@ def main() -> None:
         "--entry", type=str, default=None,
         help="Restrict crawl to one entry point, e.g. /World+Information",
     )
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Print each page as it is fetched and scraped",
+    )
     args = parser.parse_args()
-    asyncio.run(scrape(limit=args.limit, dry_run=args.dry_run, entry=args.entry))
+    asyncio.run(scrape(
+        limit=args.limit,
+        dry_run=args.dry_run,
+        entry=args.entry,
+        verbose=args.verbose,
+    ))
 
 
 if __name__ == "__main__":
