@@ -75,6 +75,8 @@ BASE_URL    = "https://eldenring.wiki.fextralife.com"
 RATE_LIMIT  = float(os.getenv("WIKI_RATE_LIMIT_SECONDS", "1.2"))
 CACHE_DIR   = Path("data_pipeline/data/cache")
 OUTPUT_FILE = Path("data_pipeline/data/pages.jsonl")
+DISCOVERED_FILE = Path("data_pipeline/data/discovered_urls.jsonl")
+NO_BREADCRUMB_FILE = Path("data_pipeline/data/no_breadcrumb.txt")
 USER_AGENT  = (
     "EldenRingRAGBot/1.0 (portfolio project; educational use; "
     "respectful scraping at ~1 req/sec)"
@@ -93,6 +95,8 @@ ENTRY_POINTS: list[tuple[str, str]] = [
     ("/Equipment+&+Magic",        "item"),        # Weapons, Armor, Spells, Talismans, etc.
     ("/Character+Information",    "lore"),        # Classes, Stats, Status Effects
     ("/Guides+&+Walkthroughs",    "quest"),       # Walkthrough, Side Quests, Endings, Crafting
+    # Test / partial entry points (use via --entry):
+    ("/Caelid",                   "location"),    # single region, for testing the DFS
 ]
 
 # ── Category refinement from breadcrumb keywords ──────────────────────────────
@@ -453,11 +457,10 @@ def extract_title(soup: BeautifulSoup) -> str:
     # Confirmed selector: <a id="page-title"> inside <h1>
     pt = soup.find(id="page-title")
     if pt:
-        return pt.get_text(strip=True)
+        return pt.get_text(strip=True).split("|")[0].strip()
     h1 = soup.find("h1")
     if h1:
-        raw = h1.get_text(strip=True)
-        return raw.split("|")[0].strip()
+        return h1.get_text(strip=True).split("|")[0].strip()
     t = soup.find("title")
     if t:
         return t.get_text(strip=True).split("|")[0].strip()
@@ -644,7 +647,7 @@ def extract_body_text(soup: BeautifulSoup) -> str:
 
 # ── Internal links ────────────────────────────────────────────────────────────
 
-def extract_content_links(soup: BeautifulSoup) -> list[str]:
+def extract_content_links(soup: BeautifulSoup, exclude_tables: bool = False) -> list[str]:
     """
     Extract all wiki content links from the page content area only.
 
@@ -652,21 +655,35 @@ def extract_content_links(soup: BeautifulSoup) -> list[str]:
     the global nav bar, so we don't need to decompose anything.
     Falls back to the full soup only if the content block is absent,
     in which case we explicitly skip any <nav>/<header> descendants.
+
+    If exclude_tables=True, the wiki_table elements are removed before link
+    harvesting. These tables (usually near the bottom of location pages) are
+    full alphabetical indexes linking to every other location — following them
+    during DFS discovery causes thousands of wasted fetches. We pass
+    exclude_tables=True during discovery and leave it False during parsing
+    (where the infobox table is still needed for stats extraction).
+
+    The soup passed in is mutated if exclude_tables=True, so callers that need
+    the tables intact afterward must pass a fresh soup.
     """
     seen: set[str] = set()
     links: list[str] = []
 
+    if exclude_tables:
+        # Remove index/navigation tables before harvesting links.
+        # wiki_table = the alphabetical location/item index tables.
+        for table in soup.select("table.wiki_table, table.sortable, table.infobox"):
+            table.decompose()
+
     content = soup.select_one("div#wiki-content-block, div.wiki-content, article")
 
     if content:
-        # Happy path: scoped to content block, no nav contamination possible
         for a in content.find_all("a", href=True):
             url = to_absolute(a["href"])
             if url and is_wiki_page(url) and url not in seen:
                 seen.add(url)
                 links.append(url)
     else:
-        # Fallback: full soup but skip links that live inside nav/header elements
         nav_els = set()
         for nav in soup.select("nav, header, div#header, div.wiki-nav, footer"):
             nav_els.update(id(el) for el in nav.find_all("a"))
@@ -712,37 +729,46 @@ def parse_page(html: str, url: str, category: str) -> WikiPage:
 
 # ── Breadcrumb-recursive crawler ──────────────────────────────────────────────
 
+def _log_no_breadcrumb(url: str, no_crumb: set[str]) -> None:
+    """Record a URL that has no breadcrumb for later review (deduplicated)."""
+    if url in no_crumb:
+        return
+    no_crumb.add(url)
+    NO_BREADCRUMB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with NO_BREADCRUMB_FILE.open("a", encoding="utf-8") as f:
+        f.write(url + "\n")
+
+
 async def crawl_recursive(
-    client:          httpx.AsyncClient,
-    sem:             asyncio.Semaphore,
-    last_t:          list[float],
-    url:             str,
-    required_prefix: list[str],
-    base_category:   str,
-    discovered:      dict[str, str],
-    limit:           Optional[int] = None,
-    verbose:         bool = False,
-    depth:           int = 0,
+    client:        httpx.AsyncClient,
+    sem:           asyncio.Semaphore,
+    last_t:        list[float],
+    url:           str,
+    parent_crumb:  list[str],       # breadcrumb of the page we came from
+    base_category: str,
+    discovered:    dict[str, str],
+    no_crumb:      set[str],         # URLs with no breadcrumb, logged for review
+    limit:         Optional[int] = None,
+    verbose:       bool = False,
+    depth:         int = 0,
 ) -> None:
     """
-    Fetch `url`, record it, then recursively follow content links whose
-    breadcrumb starts with `required_prefix`.
+    True one-level DFS using the breadcrumb as the descent rule.
 
-    `required_prefix` is fixed for the lifetime of a sub-tree crawl.
-    It is set to the breadcrumb of the FIRST real page we enter
-    (e.g. ['World Information', 'Locations']) and never changes.
-    This means every page in this crawl must belong to that sub-tree,
-    preventing cross-contamination from cross-wiki links.
+    To accept and recurse into `url`, its own breadcrumb `C` must satisfy:
+        len(C) == len(parent_crumb) + 1      (exactly one level deeper)
+        AND C[:len(parent_crumb)] == parent_crumb   (same path prefix)
+
+    Then `C` becomes the parent_crumb for this page's own children.
 
     Special cases:
-      - Page has no breadcrumb → accept and scrape, but do NOT recurse further
-        (we have no signal to know which of its links belong here)
-      - depth == 0 → this is the sub-tree root itself, always accept
+      - depth == 0 → this is the tree root, already validated by the caller.
+        We use its breadcrumb directly as parent_crumb for its children.
+      - Page has no breadcrumb → log the URL to NO_BREADCRUMB_FILE, do not
+        scrape, do not recurse.
     """
     if depth > MAX_DEPTH:
         return
-    # depth=0 is the sub-tree root, already recorded by discover_urls —
-    # skip the guard and go straight to harvesting its links.
     if depth > 0:
         if url in discovered:
             return
@@ -750,7 +776,6 @@ async def crawl_recursive(
             return
 
     try:
-        # depth=0 root was already fetched and printed by discover_urls — suppress verbose
         html = await fetch(client, url, sem, last_t, verbose=(verbose and depth > 0))
     except httpx.HTTPStatusError as e:
         if e.response.status_code != 404:
@@ -760,25 +785,33 @@ async def crawl_recursive(
         console.print(f"  [red]Error[/red] fetching {url}: {e}")
         return
 
-    soup_for_crumb = BeautifulSoup(html, "lxml")
-    current_crumb  = extract_breadcrumb(soup_for_crumb)
+    current_crumb = extract_breadcrumb(BeautifulSoup(html, "lxml"))
 
-    if depth > 0:
-        if not current_crumb:
-            # No breadcrumb — scrape it once, don't recurse
-            category = infer_category(required_prefix, base_category)
-            discovered[url] = category
-            if verbose:
-                console.print(f"  [dim][no-crumb, accepted once][/dim] {url}")
-            return
-
-        # Must start with the required prefix for this sub-tree
-        if current_crumb[:len(required_prefix)] != required_prefix:
-            return
-
-        # Record this page (depth=0 root was already recorded by discover_urls)
+    if depth == 0:
+        # Tree root — caller already validated it. Record it and use its
+        # breadcrumb as the parent for children.
         category = infer_category(current_crumb, base_category)
         discovered[url] = category
+        crumb_for_children = current_crumb
+    else:
+        # No breadcrumb → log and stop (no scrape, no recurse)
+        if not current_crumb:
+            _log_no_breadcrumb(url, no_crumb)
+            if verbose:
+                console.print(f"  [dim][no-breadcrumb, logged][/dim] {url}")
+            return
+
+        # One-level DFS rule: child must be exactly one segment deeper
+        # AND share the full parent prefix.
+        if len(current_crumb) != len(parent_crumb) + 1:
+            return
+        if current_crumb[:len(parent_crumb)] != parent_crumb:
+            return
+
+        category = infer_category(current_crumb, base_category)
+        discovered[url] = category
+        crumb_for_children = current_crumb
+
         if verbose:
             crumb_str = " / ".join(current_crumb)
             console.print(
@@ -788,8 +821,10 @@ async def crawl_recursive(
         if limit is not None and len(discovered) >= limit:
             return
 
-    # Recurse into content links — required_prefix never changes
-    content_links = extract_content_links(BeautifulSoup(html, "lxml"))
+    # Recurse into content links — children must extend crumb_for_children by one.
+    # exclude_tables=True drops the bottom index tables that link to every
+    # other location/item, which would otherwise cause thousands of wasted fetches.
+    content_links = extract_content_links(BeautifulSoup(html, "lxml"), exclude_tables=True)
     for child_url in content_links:
         if child_url not in discovered:
             await crawl_recursive(
@@ -797,9 +832,10 @@ async def crawl_recursive(
                 sem=sem,
                 last_t=last_t,
                 url=child_url,
-                required_prefix=required_prefix,
+                parent_crumb=crumb_for_children,
                 base_category=base_category,
                 discovered=discovered,
+                no_crumb=no_crumb,
                 limit=limit,
                 verbose=verbose,
                 depth=depth + 1,
@@ -817,18 +853,23 @@ async def discover_urls(
     verbose: bool = False,
 ) -> dict[str, str]:
     """
-    For each entry point:
-      1. Fetch the entry point page and collect its direct content links.
-         These are the sub-tree roots (e.g. /Locations, /NPCs, /Bosses
-         under /World+Information).
-      2. For each sub-tree root, fetch it, read its breadcrumb, and launch
-         a dedicated crawl_recursive call pinned to THAT breadcrumb prefix.
-         This prevents the Locations crawl from following Bosses links and
-         the Bosses crawl from following item links.
+    Launch a one-level-DFS breadcrumb crawl from each entry point.
+
+    The entry point itself is depth 0 — crawl_recursive reads its breadcrumb
+    and uses it as the parent for its direct children. From there, a child is
+    only followed if its breadcrumb is exactly one segment deeper and shares
+    the parent's full prefix (see crawl_recursive docstring).
+
+    Pages with no breadcrumb are logged to NO_BREADCRUMB_FILE, not scraped.
 
     Returns {url: category_label}.
     """
     discovered: dict[str, str] = {}
+    no_crumb: set[str] = set()
+
+    # Fresh no-breadcrumb log per run
+    if NO_BREADCRUMB_FILE.exists():
+        NO_BREADCRUMB_FILE.unlink()
 
     entries = ENTRY_POINTS
     if entry:
@@ -844,99 +885,37 @@ async def discover_urls(
             f"\n[bold cyan]Entry point:[/bold cyan] {path} "
             f"(base category: {base_category})"
         )
+        before = len(discovered)
 
-        # Step 1: fetch the entry point, collect its direct children
-        try:
-            entry_html = await fetch(client, entry_url, sem, last_t, verbose=verbose)
-        except Exception as e:
-            console.print(f"  [red]Failed to fetch entry point: {e}[/red]")
-            continue
-
-        # Record the entry point page itself
-        entry_soup = BeautifulSoup(entry_html, "lxml")
-        entry_crumb = extract_breadcrumb(entry_soup)
-        entry_category = infer_category(entry_crumb, base_category)
-        discovered[entry_url] = entry_category
-
-        direct_children = extract_content_links(BeautifulSoup(entry_html, "lxml"))
-        console.print(f"  Direct children found: {len(direct_children)}")
-
-        # Step 2: for each direct child, fetch it and pin a crawl to its breadcrumb
-        for child_url in direct_children:
-            if child_url in discovered:
-                continue
-
-            try:
-                child_html = await fetch(client, child_url, sem, last_t, verbose=verbose)
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code != 404:
-                    console.print(f"  [yellow]HTTP {e.response.status_code}[/yellow] {child_url}")
-                continue
-            except Exception:
-                continue
-
-            child_soup  = BeautifulSoup(child_html, "lxml")
-            child_crumb = extract_breadcrumb(child_soup)
-            child_title = extract_title(child_soup)
-
-            if not child_crumb:
-                # No breadcrumb — accept this page but don't recurse
-                child_cat = infer_category(entry_crumb, base_category)
-                discovered[child_url] = child_cat
-                if verbose:
-                    console.print(
-                        f"  [#{len(discovered):04d}] [{child_cat}] "
-                        f"{child_url.split('/')[-1]}  [dim](no breadcrumb, accepted once)[/dim]"
-                    )
-                if limit is not None and len(discovered) >= limit:
-                    return discovered
-                continue
-
-            # Build the required prefix as breadcrumb + this page's own title.
-            # e.g. /Locations has breadcrumb ['World Information'] and title 'Locations'
-            # → required_prefix = ['World Information', 'Locations']
-            # This means ONLY pages whose breadcrumb starts with
-            # ['World Information', 'Locations'] are accepted — not Bosses, NPCs etc.
-            required_prefix = child_crumb + [child_title]
-
-            child_cat = infer_category(required_prefix, base_category)
-            discovered[child_url] = child_cat
-
-            console.print(
-                f"  [green]→ sub-tree:[/green] {required_prefix} "
-                f"({child_cat}) — crawling..."
-            )
-
-            before = len(discovered)
-            await crawl_recursive(
-                client=client,
-                sem=sem,
-                last_t=last_t,
-                url=child_url,
-                required_prefix=required_prefix,
-                base_category=child_cat,
-                discovered=discovered,
-                limit=limit,
-                verbose=verbose,
-                depth=0,
-            )
-            if limit is not None and len(discovered) >= limit:
-                return discovered
-            added = len(discovered) - before
-            console.print(
-                f"    +{added} pages under {required_prefix}"
-            )
-
-        total_under_entry = sum(
-            1 for u in discovered
-            if u.startswith(BASE_URL)
+        await crawl_recursive(
+            client=client,
+            sem=sem,
+            last_t=last_t,
+            url=entry_url,
+            parent_crumb=[],          # entry point is the root; its own crumb is read inside
+            base_category=base_category,
+            discovered=discovered,
+            no_crumb=no_crumb,
+            limit=limit,
+            verbose=verbose,
+            depth=0,
         )
-        console.print(f"  Total so far: {total_under_entry} URLs")
+
+        added = len(discovered) - before
+        console.print(f"  → {added} pages discovered under {path}")
+        if limit is not None and len(discovered) >= limit:
+            break
 
     console.print(
         f"\n[bold green]Discovery complete:[/bold green] "
-        f"{len(discovered)} total URLs\n"
+        f"{len(discovered)} total URLs"
     )
+    if no_crumb:
+        console.print(
+            f"[yellow]{len(no_crumb)} pages had no breadcrumb[/yellow] "
+            f"→ logged to {NO_BREADCRUMB_FILE}"
+        )
+    console.print()
     by_cat: dict[str, int] = defaultdict(int)
     for cat in discovered.values():
         by_cat[cat] += 1
@@ -948,12 +927,52 @@ async def discover_urls(
 
 # ── Main scraper ──────────────────────────────────────────────────────────────
 
+def _save_discovered(url_map: dict[str, str]) -> None:
+    """Persist the discovery result so scraping can run later from cache."""
+    DISCOVERED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with DISCOVERED_FILE.open("w", encoding="utf-8") as f:
+        for url, category in url_map.items():
+            f.write(json.dumps({"url": url, "category": category}, ensure_ascii=False) + "\n")
+
+
+def _load_discovered() -> dict[str, str]:
+    """Load a previously saved discovery result."""
+    url_map: dict[str, str] = {}
+    if not DISCOVERED_FILE.exists():
+        return url_map
+    with DISCOVERED_FILE.open(encoding="utf-8") as f:
+        for line in f:
+            try:
+                obj = json.loads(line)
+                url_map[obj["url"]] = obj["category"]
+            except Exception:
+                pass
+    return url_map
+
+
 async def scrape(
-    limit:    Optional[int] = None,
-    dry_run:  bool = False,
-    entry:    Optional[str] = None,
-    verbose:  bool = False,
+    limit:         Optional[int] = None,
+    dry_run:       bool = False,
+    entry:         Optional[str] = None,
+    verbose:       bool = False,
+    discover_only: bool = False,
+    scrape_only:   bool = False,
 ) -> None:
+    """
+    Two-phase pipeline:
+
+      Discovery phase (network): walk the breadcrumb DFS from each entry point,
+        produce {url: category}, and save it to DISCOVERED_FILE.
+
+      Scrape phase (cache): read DISCOVERED_FILE, parse each page from the HTML
+        cache (no network needed if already cached), write to OUTPUT_FILE.
+
+    Flags:
+      --discover-only : run discovery, save the URL list, then stop.
+      --scrape-only   : skip discovery, load the saved URL list, scrape from cache.
+      (default)       : run discovery then scraping in one go.
+      --dry-run       : run discovery, print a summary, scrape nothing.
+    """
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -961,7 +980,25 @@ async def scrape(
     last_t = [0.0]
 
     async with build_client() as client:
-        url_map = await discover_urls(client, sem, last_t, entry=entry, limit=limit, verbose=verbose)
+        # ── Phase 1: Discovery ────────────────────────────────────────────────
+        if scrape_only:
+            url_map = _load_discovered()
+            if not url_map:
+                console.print(
+                    f"[red]No discovered URLs found at {DISCOVERED_FILE}.[/red] "
+                    f"Run discovery first (without --scrape-only)."
+                )
+                return
+            console.print(
+                f"[bold cyan]Loaded {len(url_map)} discovered URLs from "
+                f"{DISCOVERED_FILE}[/bold cyan]"
+            )
+        else:
+            url_map = await discover_urls(
+                client, sem, last_t, entry=entry, limit=limit, verbose=verbose
+            )
+            _save_discovered(url_map)
+            console.print(f"[dim]Discovery saved → {DISCOVERED_FILE}[/dim]")
 
         urls = list(url_map.items())
         if limit:
@@ -983,6 +1020,15 @@ async def scrape(
                 console.print()
             return
 
+        if discover_only:
+            console.print(
+                f"\n[bold green]Discovery complete.[/bold green] "
+                f"{len(url_map)} URLs saved to {DISCOVERED_FILE}. "
+                f"Run with --scrape-only to scrape from cache."
+            )
+            return
+
+        # ── Phase 2: Scrape ───────────────────────────────────────────────────
         console.print(f"\n[bold cyan]Scraping {len(urls)} pages...[/bold cyan]")
 
         # Resume support
@@ -1075,12 +1121,22 @@ def main() -> None:
         "--verbose", action="store_true",
         help="Print each page as it is fetched and scraped",
     )
+    parser.add_argument(
+        "--discover-only", action="store_true",
+        help="Run discovery, save the URL list to discovered_urls.jsonl, then stop",
+    )
+    parser.add_argument(
+        "--scrape-only", action="store_true",
+        help="Skip discovery; load discovered_urls.jsonl and scrape from cache",
+    )
     args = parser.parse_args()
     asyncio.run(scrape(
         limit=args.limit,
         dry_run=args.dry_run,
         entry=args.entry,
         verbose=args.verbose,
+        discover_only=args.discover_only,
+        scrape_only=args.scrape_only,
     ))
 
 

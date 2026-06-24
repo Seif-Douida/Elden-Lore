@@ -10,6 +10,8 @@ wheels/
 .venv
 qdrant_storage
 data_pipeline/data/cache
+data_pipeline/data/discovered_urls.jsonl
+data_pipeline/data/no_breadcrumb.txt
 data_pipeline/data/pages.jsonl
 __init__.py
 .env
