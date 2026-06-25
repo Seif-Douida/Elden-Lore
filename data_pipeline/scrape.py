@@ -117,6 +117,32 @@ def extract_image_url(soup: BeautifulSoup) -> Optional[str]:
 
 # ── Infobox ───────────────────────────────────────────────────────────────────
 
+def _is_mashed_stats(key: str, val: str) -> bool:
+    """
+    True for stat-table rows that got flattened into unreadable blobs, e.g.
+        key="AttackPhy116Mag0Fire0Ligt0Holy0Crit100"  val="GuardPhy 63Mag31..."
+        key="ScalingStrDDexC"                          val="RequiresStr18Dex17"
+        key="Wgt.6.5"                                  val="Passive-"
+    These come from weapon/boss stat grids that have no cell spacing. The same
+    numbers appear cleanly in body_text, so we drop the mangled infobox copy.
+
+    We must NOT drop short legitimate values like "FP9" (an Ash of War's FP cost)
+    or "FP8 ( - 12)". The distinguishing feature of a mashed grid is *multiple*
+    run-together stat groups, so we require 2+ digit-runs (or a Scaling/Requires
+    CamelCase key) rather than firing on any single letter-digit token.
+    """
+    for s in (key, val):
+        if not s:
+            continue
+        # 2+ separate digit-runs crammed into a (near-)spaceless token → mashed
+        if len(re.findall(r"\d+", s)) >= 2 and s.count(" ") <= 1:
+            return True
+    # A "Scaling…"/"Requires…" key with run-together CamelCase stat codes
+    if re.search(r"(Scaling|Requires)[A-Z].*[A-Z]", key) and " " not in key:
+        return True
+    return False
+
+
 def extract_infobox(soup: BeautifulSoup) -> dict[str, str]:
     infobox: dict[str, str] = {}
     for table in soup.select("table.wiki_table, table.infobox")[:2]:
@@ -125,12 +151,15 @@ def extract_infobox(soup: BeautifulSoup) -> dict[str, str]:
             if len(cells) == 2:
                 k = normalise(cells[0].get_text(strip=True))
                 v = normalise(cells[1].get_text(strip=True))
-                if k and v and len(k) < 80 and not _is_nav_list(k) and not _is_nav_list(v):
-                    infobox[k] = v
-            elif len(cells) == 1:
-                h = normalise(cells[0].get_text(strip=True))
-                if h and not _is_nav_list(h):
-                    infobox["_section"] = h
+                if not k or not v or len(k) >= 80:
+                    continue
+                if _is_nav_list(k) or _is_nav_list(v):
+                    continue
+                if _is_mashed_stats(k, v):
+                    continue            # garbled stat grid — body has it cleanly
+                infobox[k] = v
+            # Single-cell rows are section headings (page title etc.) — skip them.
+            # We no longer store a "_section" key; it was pure noise.
     return infobox
 
 
@@ -140,6 +169,15 @@ _DIALOGUE_RE = re.compile(r"dialogue|speech|quotes|voice", re.I)
 
 
 def extract_dialogue(soup: BeautifulSoup) -> list[str]:
+    """
+    Extract genuine NPC dialogue. Two reliable signals only:
+      1. <blockquote> inside a table  → NPC speech blocks on Fextralife
+      2. content under a 'Dialogue' / 'Speech' / 'Quotes' heading
+
+    We deliberately do NOT scan generic <td><em> cells: on location pages
+    those are italicised description captions ("A dilapidated church found
+    east of Sellia...") which are NOT dialogue and were polluting the field.
+    """
     lines: list[str] = []
     seen: set[str] = set()
 
@@ -149,10 +187,12 @@ def extract_dialogue(soup: BeautifulSoup) -> list[str]:
             seen.add(t)
             lines.append(t)
 
+    # 1. Blockquotes inside tables — the most reliable NPC-speech signal
     for table in soup.find_all("table"):
         for bq in table.find_all("blockquote"):
             _add(bq.get_text(separator=" ", strip=True))
 
+    # 2. Content under an explicit Dialogue / Speech / Quotes heading
     for heading in soup.find_all(["h2", "h3", "h4"]):
         if not _DIALOGUE_RE.search(heading.get_text()):
             continue
@@ -166,11 +206,6 @@ def extract_dialogue(soup: BeautifulSoup) -> list[str]:
             elif sibling.name in ("h2", "h3", "h4"):
                 break
             sibling = sibling.find_next_sibling()
-
-    for cell in soup.select("td em, td i"):
-        text = cell.get_text(separator=" ", strip=True)
-        if len(text) >= 30 and re.search(r'[.!?"\']$', text):
-            _add(text)
 
     return lines
 
@@ -228,19 +263,54 @@ def extract_item_descriptions(soup: BeautifulSoup) -> list[str]:
 
 # ── Body text ─────────────────────────────────────────────────────────────────
 
+# Inline-noise patterns to remove from body lines.
+_MAP_LINK_RE   = re.compile(r"\[\s*(Elden Ring\s+)?Map Link\s*\]", re.I)
+_BRACKET_NOISE = re.compile(r"\[\s*\]")  # empty brackets left after removal
+
+
+def _clean_body_line(text: str) -> str:
+    text = _MAP_LINK_RE.sub("", text)
+    text = _BRACKET_NOISE.sub("", text)
+    return normalise(text)
+
+
 def extract_body_text(soup: BeautifulSoup) -> str:
+    """
+    Build the body text while PRESERVING heading structure so the chunker can
+    later split pages by section. Headings (h2/h3/h4) are emitted on their own
+    line prefixed with a '## ' marker; the chunker splits on these.
+
+    Also removes inline '[ Map Link ]' noise and skips ♦ nav lists.
+    """
     content = (
         soup.select_one("div#wiki-content-block, div.wiki-content, article, div[role='main']")
         or soup.find("body")
         or soup
     )
-    lines: list[str] = []
+
+    out: list[str] = []
+    seen_headings: set[str] = set()
+
     for el in content.find_all(["p", "li", "h2", "h3", "h4", "td"]):
-        text = el.get_text(separator=" ", strip=True)
+        raw = el.get_text(separator=" ", strip=True)
+        if not raw:
+            continue
+
+        if el.name in ("h2", "h3", "h4"):
+            heading = _clean_body_line(raw)
+            # Skip empty or duplicate headings (Fextralife repeats the tab labels)
+            if not heading or heading in seen_headings:
+                continue
+            seen_headings.add(heading)
+            out.append(f"## {heading}")
+            continue
+
+        text = _clean_body_line(raw)
         if len(text) < 20 or _is_nav_list(text):
             continue
-        lines.append(text)
-    return normalise("\n".join(lines))
+        out.append(text)
+
+    return normalise("\n".join(out))
 
 
 # ── Internal links (for the record; tables kept intact here) ──────────────────
@@ -259,6 +329,23 @@ def extract_internal_links(soup: BeautifulSoup) -> list[str]:
 
 # ── Full page parser ──────────────────────────────────────────────────────────
 
+# A page is treated as a "walkthrough" (huge, section-structured, chunked
+# specially) if its title says so or its body is very large.
+_WALKTHROUGH_TITLE_RE = re.compile(r"walkthrough|game progress route", re.I)
+_WALKTHROUGH_MIN_LEN  = 50_000
+
+
+def _detect_doc_type(title: str, breadcrumb: list[str], body_len: int) -> str:
+    crumb = " / ".join(breadcrumb).lower()
+    if _WALKTHROUGH_TITLE_RE.search(title):
+        return "walkthrough"
+    if "walkthrough" in crumb and body_len >= _WALKTHROUGH_MIN_LEN:
+        return "walkthrough"
+    if body_len >= _WALKTHROUGH_MIN_LEN:
+        return "walkthrough"
+    return "page"
+
+
 def parse_page(html: str, url: str, category: str) -> WikiPage:
     # Breadcrumb is read before noise stripping (its container is in NOISE_SELECTORS)
     soup = BeautifulSoup(html, "lxml")
@@ -274,12 +361,16 @@ def parse_page(html: str, url: str, category: str) -> WikiPage:
 
     strip_noise(soup)
 
+    body_text = extract_body_text(soup)
+    doc_type = _detect_doc_type(title, breadcrumb, len(body_text))
+
     return WikiPage(
         url=url,
         title=title,
         category=category,
+        doc_type=doc_type,
         breadcrumb=breadcrumb,
-        body_text=extract_body_text(soup),
+        body_text=body_text,
         infobox=extract_infobox(soup),
         dialogue=extract_dialogue(soup),
         item_descriptions=extract_item_descriptions(soup),

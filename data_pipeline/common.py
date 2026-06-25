@@ -40,7 +40,7 @@ console = Console()
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 BASE_URL    = "https://eldenring.wiki.fextralife.com"
-RATE_LIMIT  = float(os.getenv("WIKI_RATE_LIMIT_SECONDS", "0.5"))
+RATE_LIMIT  = float(os.getenv("WIKI_RATE_LIMIT_SECONDS", "1.2"))
 
 DATA_DIR           = Path("data_pipeline/data")
 CACHE_DIR          = DATA_DIR / "cache"
@@ -141,6 +141,7 @@ class WikiPage:
     url:               str
     title:             str
     category:          str
+    doc_type:          str                # "walkthrough" | "page"
     breadcrumb:        list[str]          # ["World Information", "Locations", "Caelid"]
     body_text:         str
     infobox:           dict[str, str]
