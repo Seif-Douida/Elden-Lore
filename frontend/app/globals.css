@@ -1,0 +1,90 @@
+/* app/globals.css */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --abyss: #0e0d0b;
+  --ash: #16140f;
+  --ash-hi: #1f1c15;
+  --parchment: #e8e0cf;
+  --parchment-dim: #9c957f;
+  --gold: #c8a24c;
+  --gold-bright: #e6b85c;
+  --gold-dim: #6b5a2e;
+  --radius: 12px;
+}
+
+html,
+body {
+  padding: 0;
+  margin: 0;
+  height: 100%;
+  background: var(--abyss);
+  color: var(--parchment);
+  font-family: var(--font-body), Georgia, serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.font-display {
+  font-family: var(--font-display), serif;
+}
+
+/* Thin gold scrollbars */
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--gold-dim);
+  border-radius: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Respect reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+
+/* Streaming cursor */
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+.cursor-pulse {
+  display: inline-block;
+  width: 8px;
+  height: 1.1em;
+  background: var(--gold);
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: pulse 1s ease-in-out infinite;
+}
+
+/* Markdown answer styling */
+.answer h1, .answer h2, .answer h3 {
+  font-family: var(--font-display), serif;
+  color: var(--gold);
+  margin: 1.2em 0 0.5em;
+  font-weight: 400;
+}
+.answer h2 { font-size: 1.25rem; }
+.answer h3 { font-size: 1.1rem; }
+.answer p { margin: 0 0 0.85em; line-height: 1.7; }
+.answer ul, .answer ol { margin: 0 0 0.85em; padding-left: 1.4em; line-height: 1.7; }
+.answer li { margin: 0.2em 0; }
+.answer strong { color: var(--gold); font-weight: 600; }
+.answer a { color: var(--gold-bright); text-decoration: underline; }
+.answer code {
+  background: var(--ash-hi);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+  font-size: 0.9em;
+}

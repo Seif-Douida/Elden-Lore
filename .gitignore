@@ -8,11 +8,18 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Secrets
+.env
+
+# Qdrant Docker named volume (lives in WSL2, not the repo)
 qdrant_storage
+
+# Data pipeline — large generated artifacts (reproducible; do not push)
 data_pipeline/data/cache
 data_pipeline/data/discovered_urls.jsonl
 data_pipeline/data/no_breadcrumb.txt
 data_pipeline/data/pages.jsonl
-__init__.py
-.env
+data_pipeline/data/chunks.jsonl
+data_pipeline/data/embeddings/
 

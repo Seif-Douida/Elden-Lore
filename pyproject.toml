@@ -20,8 +20,12 @@ dependencies = [
 
     # --- Embeddings ---
     "sentence-transformers>=3.4",
-    "torch>=2.5",                # CPU-only — see note below
-
+    "torch>=2.5",                # CUDA build on Win/Linux via [tool.uv.sources] below
+    "langchain-nvidia-ai-endpoints>=0.3",
+    "langchain-google-genai>=2.0",
+    "langchain-ollama>=0.2",
+    "rapidfuzz>=3.10",
+    "jellyfish>=1.1",
     # --- Vector DB ---
     "qdrant-client>=1.13",
 
@@ -30,6 +34,12 @@ dependencies = [
     "tenacity>=9.0",             # retry logic for scraping
     "tqdm>=4.67",                # progress bars
     "rich>=13.9",                # better console output
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic-settings>=2.5",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.30",
+    "alembic>=1.13",
 ]
 
 [dependency-groups]
@@ -38,6 +48,22 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "ipykernel>=6.29",           # notebook support for exploration
+]
+
+# ── PyTorch CUDA build ─────────────────────────────────────────────
+# PyPI serves CPU-only torch wheels on Windows by default, which is why
+# `uv run` kept reverting to +cpu. Routing torch to the cu121 index makes
+# the CUDA build the locked source of truth (GTX 1650 = Turing, cu121 is the
+# safe, broadly-compatible choice). On macOS there are no CUDA wheels, so we
+# gate the source to Windows + Linux and let macOS fall back to PyPI.
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu121", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
 ]
 
 [tool.ruff]
