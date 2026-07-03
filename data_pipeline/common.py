@@ -40,9 +40,14 @@ console = Console()
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 BASE_URL    = "https://eldenring.wiki.fextralife.com"
-RATE_LIMIT  = float(os.getenv("WIKI_RATE_LIMIT_SECONDS", "1.2"))
+RATE_LIMIT  = float(os.getenv("WIKI_RATE_LIMIT_SECONDS", "0.5"))
 
-DATA_DIR           = Path("data_pipeline/data")
+# Anchor data paths on THIS file's location, not the current working directory,
+# so the pipeline works whether run from the project root (python data_pipeline/x.py)
+# or from inside data_pipeline/ (python x.py). A CWD-relative path here created a
+# nested data_pipeline/data_pipeline/data/ tree when run from the wrong directory.
+_PIPELINE_DIR      = Path(__file__).resolve().parent          # …/elden-ring-rag/data_pipeline
+DATA_DIR           = _PIPELINE_DIR / "data"
 CACHE_DIR          = DATA_DIR / "cache"
 DISCOVERED_FILE    = DATA_DIR / "discovered_urls.jsonl"
 NO_BREADCRUMB_FILE = DATA_DIR / "no_breadcrumb.txt"
@@ -66,7 +71,7 @@ ENTRY_POINTS: list[tuple[str, str]] = [
     ("/Character+Information", "lore"),        # Classes, Stats, Status Effects
     ("/Guides+&+Walkthroughs", "quest"),       # Walkthrough, Side Quests, Endings, Crafting
     # Test / partial entry point (use via --entry):
-    ("/Caelid",                "location"),    # single region, for testing the DFS
+    ("/Katanas",                "item"),    # single region, for testing the DFS
 ]
 
 # ── Category inference ────────────────────────────────────────────────────────
@@ -117,7 +122,7 @@ SKIP_PATHS: frozenset[str] = frozenset({
     "/Build+Calculator", "/Summon+Range+Calculator", "/New+Game+Plus",
     "/Nightreign", "/Elden+Ring+Movie", "/Elden+Ring+Tarnished+Edition",
     "/Multiplayer+Items", "/Gestures", "/Rebirth", "/todo",
-    "/Trophy+&+Achievement+Guide", "/Wiki+Shop", "/Covenants",
+    "/Trophy+&+Achievement+Guide", "/Wiki+Shop", "/Covenants", "/Passive+Effects",
 })
 
 SKIP_URL_FRAGMENTS: tuple[str, ...] = (

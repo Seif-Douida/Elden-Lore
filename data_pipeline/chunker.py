@@ -357,17 +357,25 @@ def chunk_page(page: dict, ent_ctx) -> list[Chunk]:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run(limit: Optional[int] = None, verbose: bool = False) -> None:
-    if not PAGES_FILE.exists():
-        console.print(f"[red]No pages file at {PAGES_FILE}. Run scrape.py first.[/red]")
+def run(limit: Optional[int] = None, verbose: bool = False,
+        input_file: Optional[str] = None, output_file: Optional[str] = None) -> None:
+    # Pages to chunk come from --input (default pages.jsonl). The gazetteer is
+    # ALWAYS built from the full pages.jsonl so supplement chunks get complete
+    # entity tags even when --input is a smaller supplement file.
+    pages_path  = Path(input_file) if input_file else PAGES_FILE
+    chunks_path = Path(output_file) if output_file else CHUNKS_FILE
+
+    if not pages_path.exists():
+        console.print(f"[red]No pages file at {pages_path}. Run scrape.py first.[/red]")
         return
 
-    pages = [json.loads(l) for l in PAGES_FILE.open(encoding="utf-8")]
+    pages = [json.loads(l) for l in pages_path.open(encoding="utf-8")]
     if limit:
         pages = pages[:limit]
     console.print(f"[bold cyan]Chunking {len(pages)} pages[/bold cyan]")
 
-    # Build entity gazetteer from the FULL page set (not just the limited slice)
+    # Build entity gazetteer from the FULL corpus (pages.jsonl), not the --input
+    # slice, so entity tagging is complete regardless of what we're chunking now.
     all_pages = [json.loads(l) for l in PAGES_FILE.open(encoding="utf-8")]
     gazetteer = build_gazetteer(all_pages)
     console.print(f"[dim]Entity gazetteer: {len(gazetteer)} names[/dim]")
@@ -378,12 +386,12 @@ def run(limit: Optional[int] = None, verbose: bool = False) -> None:
     dropped_dupes = 0
     by_type: dict[str, int] = {}
 
-    CHUNKS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    chunks_path.parent.mkdir(parents=True, exist_ok=True)
 
     with Progress(
         SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
         BarColumn(), TaskProgressColumn(), console=console,
-    ) as progress, CHUNKS_FILE.open("w", encoding="utf-8") as out_f:
+    ) as progress, chunks_path.open("w", encoding="utf-8") as out_f:
         task = progress.add_task("Chunking...", total=len(pages))
         for page in pages:
             progress.update(task, advance=1, description=f"[cyan]{page['title'][:40]}")
@@ -402,7 +410,7 @@ def run(limit: Optional[int] = None, verbose: bool = False) -> None:
                         f"[dim]{len(ch.entities)} ents[/dim]  {ch.raw_text[:60]}"
                     )
 
-    console.print(f"\n[bold green]Done![/bold green] {written} chunks → {CHUNKS_FILE}")
+    console.print(f"\n[bold green]Done![/bold green] {written} chunks → {chunks_path}")
     console.print(f"  by type: {by_type}")
     console.print(f"  deduped: {dropped_dupes} duplicate chunks dropped")
 
@@ -413,8 +421,13 @@ def main() -> None:
                         help="Chunk only the first N pages (testing)")
     parser.add_argument("--verbose", action="store_true",
                         help="Print each chunk as it is produced")
+    parser.add_argument("--input", type=str, default=None,
+                        help="pages jsonl to chunk (default data/pages.jsonl)")
+    parser.add_argument("--output", type=str, default=None,
+                        help="chunks jsonl to write (default data/chunks.jsonl)")
     args = parser.parse_args()
-    run(limit=args.limit, verbose=args.verbose)
+    run(limit=args.limit, verbose=args.verbose,
+        input_file=args.input, output_file=args.output)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ import json
 import os
 import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 from rich.console import Console
@@ -54,19 +55,23 @@ UPSERT_BATCH = int(os.getenv("UPSERT_BATCH", "256"))
 WAIT_CEILING_SEC = int(os.getenv("WAIT_CEILING_SEC", "1200"))   # 20 min
 
 
-def _load_artifacts():
-    if not VECTORS_FILE.exists():
-        console.print(f"[red]No embeddings at {EMBED_DIR}. Run embed.py first.[/red]")
+def _load_artifacts(embed_dir: Path):
+    vectors_file  = embed_dir / "vectors.npy"
+    ids_file      = embed_dir / "ids.npy"
+    payloads_file = embed_dir / "payloads.jsonl"
+    meta_file     = embed_dir / "meta.json"
+    if not vectors_file.exists():
+        console.print(f"[red]No embeddings at {embed_dir}. Run embed.py first.[/red]")
         return None
-    vectors = np.load(VECTORS_FILE)
-    ids = np.load(IDS_FILE)
-    payloads = [json.loads(l) for l in PAYLOADS_FILE.open(encoding="utf-8")]
+    vectors = np.load(vectors_file)
+    ids = np.load(ids_file)
+    payloads = [json.loads(l) for l in payloads_file.open(encoding="utf-8")]
     if not (len(vectors) == len(ids) == len(payloads)):
         console.print(f"[red]Length mismatch: vectors={len(vectors)} ids={len(ids)} "
                       f"payloads={len(payloads)}[/red]")
         return None
-    if META_FILE.exists():
-        meta = json.loads(META_FILE.read_text(encoding="utf-8"))
+    if meta_file.exists():
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
         if not meta.get("ok", True):
             console.print("[yellow]Warning: embed.py reported failing sanity checks.[/yellow]")
     return vectors, ids, payloads
@@ -90,8 +95,9 @@ def _wait_for_green(client, target: int) -> None:
                   "Check before stopping the container.[/yellow]")
 
 
-def run(recreate: bool = False) -> None:
-    art = _load_artifacts()
+def run(recreate: bool = False, embeddings_dir: Optional[str] = None) -> None:
+    embed_dir = Path(embeddings_dir) if embeddings_dir else EMBED_DIR
+    art = _load_artifacts(embed_dir)
     if art is None:
         return
     vectors, ids, payloads = art
@@ -175,8 +181,11 @@ def run(recreate: bool = False) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Elden Ring — upload embeddings to Qdrant")
     parser.add_argument("--recreate", action="store_true", help="drop & rebuild the collection")
+    parser.add_argument("--embeddings-dir", type=str, default=None,
+                        help="artifacts dir to upload (default data/embeddings); point at a "
+                             "supplement dir to upsert only new points")
     args = parser.parse_args()
-    run(recreate=args.recreate)
+    run(recreate=args.recreate, embeddings_dir=args.embeddings_dir)
 
 
 if __name__ == "__main__":

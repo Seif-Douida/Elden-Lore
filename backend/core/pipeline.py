@@ -69,12 +69,17 @@ class Pipeline:
             **boost_kwargs,
         )
 
+        # Use a focused retrieval query when the router stripped context noise
+        # (e.g. "I am in X, how do I reach Y?" → embed only "how to reach Y").
+        # Falls back to the raw question when retrieval_query is None.
+        embed_query = decision.retrieval_query or question
+
         # ── Attempt 1: hard entity filter (if any entity resolved) ───────────
         entity_fallback = False
         chunks: list[RetrievedChunk] = []
         if decision.entity_focus:
             chunks = self._retriever.retrieve(
-                question, entities=decision.entity_focus, **common
+                embed_query, entities=decision.entity_focus, **common
             )
             if not chunks:
                 # ── Fallback: drop the entity filter, keep intent/boosts ─────
@@ -83,9 +88,9 @@ class Pipeline:
                     f"entity filter {decision.entity_focus} returned empty → "
                     "fell back to no-entity search (check entity casing/coverage)"
                 )
-                chunks = self._retriever.retrieve(question, **common)
+                chunks = self._retriever.retrieve(embed_query, **common)
         else:
-            chunks = self._retriever.retrieve(question, **common)
+            chunks = self._retriever.retrieve(embed_query, **common)
 
         return PipelineResult(
             question=question,

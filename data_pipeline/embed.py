@@ -89,15 +89,50 @@ def to_payload(chunk: dict) -> dict:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run(limit: Optional[int] = None) -> None:
-    if not CHUNKS_FILE.exists():
-        console.print(f"[red]No chunks file at {CHUNKS_FILE}. Run chunker.py first.[/red]")
+def run(
+    limit: Optional[int] = None,
+    chunks_file: Optional[str] = None,
+    out_dir: Optional[str] = None,
+    skip_existing: Optional[str] = None,
+) -> None:
+    # Resolve I/O paths (defaults preserve the original single-corpus behaviour).
+    chunks_path   = Path(chunks_file) if chunks_file else CHUNKS_FILE
+    out           = Path(out_dir) if out_dir else EMBED_DIR
+    vectors_file  = out / "vectors.npy"
+    ids_file      = out / "ids.npy"
+    payloads_file = out / "payloads.jsonl"
+    meta_file     = out / "meta.json"
+
+    if not chunks_path.exists():
+        console.print(f"[red]No chunks file at {chunks_path}. Run chunker.py first.[/red]")
         return
 
-    chunks = [json.loads(l) for l in CHUNKS_FILE.open(encoding="utf-8")]
+    chunks = [json.loads(l) for l in chunks_path.open(encoding="utf-8")]
     if limit:
         chunks = chunks[:limit]
+
+    # Delta mode: skip chunks already embedded in a prior artifact dir, so a
+    # supplementary pass only embeds the NEW chunks (deterministic point ids make
+    # this exact). Point the new rows at a fresh --out-dir; upload.py upserts them.
+    if skip_existing:
+        existing_ids_file = Path(skip_existing) / "ids.npy"
+        if existing_ids_file.exists():
+            existing = set(int(x) for x in np.load(existing_ids_file).tolist())
+            before = len(chunks)
+            chunks = [c for c in chunks if point_id(c["chunk_id"]) not in existing]
+            console.print(
+                f"[dim]skip-existing: {before - len(chunks)} already embedded in "
+                f"{skip_existing}, {len(chunks)} new[/dim]"
+            )
+        else:
+            console.print(
+                f"[yellow]skip-existing: no ids.npy under {skip_existing} — embedding all.[/yellow]"
+            )
+
     n = len(chunks)
+    if n == 0:
+        console.print("[green]No new chunks to embed — nothing to do.[/green]")
+        return
     console.print(f"[bold cyan]Embedding {n} chunks[/bold cyan]")
 
     from sentence_transformers import SentenceTransformer
@@ -114,13 +149,13 @@ def run(limit: Optional[int] = None) -> None:
         except Exception:
             pass
 
-    EMBED_DIR.mkdir(parents=True, exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
 
     # Pre-allocate the vectors array; fill row by row.
     vectors = np.zeros((n, VECTOR_DIM), dtype=np.float32)
     ids = np.zeros(n, dtype=np.uint64)
 
-    with PAYLOADS_FILE.open("w", encoding="utf-8") as pf, Progress(
+    with payloads_file.open("w", encoding="utf-8") as pf, Progress(
         SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
         BarColumn(), TaskProgressColumn(), console=console,
     ) as progress:
@@ -169,8 +204,8 @@ def run(limit: Optional[int] = None) -> None:
         console.print("  [yellow]warning: norms not ≈1.0 — check normalize_embeddings[/yellow]")
 
     # ── Save artifacts ───────────────────────────────────────────────────────
-    np.save(VECTORS_FILE, vectors)
-    np.save(IDS_FILE, ids)
+    np.save(vectors_file, vectors)
+    np.save(ids_file, ids)
     meta = {
         "model": EMBED_MODEL,
         "vector_dim": VECTOR_DIM,
@@ -179,9 +214,9 @@ def run(limit: Optional[int] = None) -> None:
         "checks": checks,
         "ok": ok,
     }
-    META_FILE.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
-    console.print(f"\n[bold green]Done![/bold green] Saved to {EMBED_DIR}/")
+    console.print(f"\n[bold green]Done![/bold green] Saved to {out}/")
     console.print(f"  vectors.npy   {vectors.shape} float32 (~{vectors.nbytes/1e6:.0f} MB)")
     console.print(f"  ids.npy       {ids.shape} uint64")
     console.print(f"  payloads.jsonl {n} lines")
@@ -195,11 +230,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Elden Ring — embed chunks to disk")
     parser.add_argument("--limit", type=int, default=None, help="embed only first N chunks")
     parser.add_argument("--batch", type=int, default=None, help="override embed batch size")
+    parser.add_argument("--chunks-file", type=str, default=None,
+                        help="input chunks jsonl (default data/chunks.jsonl)")
+    parser.add_argument("--out-dir", type=str, default=None,
+                        help="output artifacts dir (default data/embeddings)")
+    parser.add_argument("--skip-existing", type=str, default=None,
+                        help="artifacts dir whose ids.npy marks already-embedded chunks "
+                             "to skip (delta mode for a supplementary pass)")
     args = parser.parse_args()
     if args.batch:
         global EMBED_BATCH
         EMBED_BATCH = args.batch
-    run(limit=args.limit)
+    run(limit=args.limit, chunks_file=args.chunks_file,
+        out_dir=args.out_dir, skip_existing=args.skip_existing)
 
 
 if __name__ == "__main__":

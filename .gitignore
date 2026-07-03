@@ -21,5 +21,13 @@ data_pipeline/data/discovered_urls.jsonl
 data_pipeline/data/no_breadcrumb.txt
 data_pipeline/data/pages.jsonl
 data_pipeline/data/chunks.jsonl
-data_pipeline/data/embeddings/
+data_pipeline/data/*_supplement.jsonl
+data_pipeline/data/embeddings*/
+
+# Eval — generated benchmark run outputs (reproducible)
+backend/eval/results/
+
+# CLI scratch outputs (router.py / pipeline.py --out defaults)
+router_output.txt
+pipeline_output.txt
 

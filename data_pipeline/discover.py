@@ -49,18 +49,42 @@ from common import (
 
 # ── Link extraction (discovery-time) ──────────────────────────────────────────
 
+# Footer navigation tables (the big alphabetical "all weapons / all locations /
+# all NPCs" blocks repeated at the bottom of every page) separate their links with a
+# diamond bullet (♦). Meaningful CONTENT tables — the per-category item lists that are
+# the only link path to some pages (e.g. the Katanas table linking Moonveil) — do not.
+# We use that marker to strip only the footer navboxes.
+_NAV_TABLE_MARKERS = ("♦", "◆")  # U+2666, U+25C6
+
+
+def _is_footer_nav_table(table) -> bool:
+    """A footer index/nav table, identified by the diamond-bullet link separator."""
+    text = table.get_text()
+    return any(m in text for m in _NAV_TABLE_MARKERS)
+
+
 def extract_links_for_discovery(soup: BeautifulSoup) -> list[str]:
     """
-    Collect wiki content links from a page, EXCLUDING the bottom index tables.
+    Collect wiki content links from a page, EXCLUDING the footer navigation tables.
 
-    The wiki_table / sortable / infobox tables near the bottom of location and
-    item pages are full alphabetical indexes linking to every sibling page.
-    Following them during DFS causes thousands of fetch-then-reject cycles, so
-    we strip them before harvesting links.
+    The footer nav tables (alphabetical "all weapons / all locations / all NPCs"
+    blocks repeated at the bottom of every page) link to every sibling and cause
+    thousands of fetch-then-reject cycles during DFS, so we strip them. They are
+    identified by a diamond-bullet (♦) separator between links.
+
+    We strip ONLY those (plus per-page infoboxes). Earlier this removed ALL
+    wiki_table/sortable tables, which also dropped meaningful CONTENT tables (e.g.
+    the Katanas list), so item pages reachable only through them — Moonveil,
+    Dragonscale Blade, Serpentbone Blade… — never entered the corpus.
     """
-    # Remove index/navigation tables before harvesting.
-    for table in soup.select("table.wiki_table, table.sortable, table.infobox"):
+    # Per-page infoboxes are stat sidebars, never a discovery path — always drop.
+    for table in soup.select("table.infobox"):
         table.decompose()
+    # Among wiki_table/sortable, drop only the ♦-marked footer navboxes; keep
+    # meaningful content tables so their item links are harvested.
+    for table in soup.select("table.wiki_table, table.sortable"):
+        if _is_footer_nav_table(table):
+            table.decompose()
 
     seen: set[str] = set()
     links: list[str] = []
@@ -100,17 +124,25 @@ async def crawl(
     parent_crumb:  list[str],
     base_category: str,
     discovered:    dict[str, str],
+    visited:       set[str],         # per-RUN cycle guard (separate from the output)
     no_crumb:      set[str],
     progress:      dict,             # {"next_milestone": int} — periodic log state
     limit_target:  Optional[int] = None,  # absolute size of `discovered` to stop at
     verbose:       bool = False,
     depth:         int = 0,
 ) -> None:
-    """One-level breadcrumb DFS. See module docstring for the rule."""
+    """One-level breadcrumb DFS. See module docstring for the rule.
+
+    `visited` is the cycle guard for THIS run; `discovered` is the accumulating
+    output manifest (pre-loaded on re-runs). Keeping them separate means a re-run
+    actually re-walks pages already in the manifest — so an improved link filter
+    can surface newly-reachable children — instead of short-circuiting on the very
+    first page because it was discovered in a prior run.
+    """
     if depth > MAX_DEPTH:
         return
     if depth > 0:
-        if url in discovered:
+        if url in visited:
             return
         if limit_target is not None and len(discovered) >= limit_target:
             return
@@ -132,6 +164,7 @@ async def crawl(
         # Tree root — accept unconditionally, use its breadcrumb for children.
         category = infer_category(current_crumb, base_category)
         discovered[url] = category
+        visited.add(url)
         crumb_for_children = current_crumb
     else:
         if not current_crumb:
@@ -148,6 +181,7 @@ async def crawl(
 
         category = infer_category(current_crumb, base_category)
         discovered[url] = category
+        visited.add(url)
         crumb_for_children = current_crumb
 
         if verbose:
@@ -169,14 +203,14 @@ async def crawl(
         # Advance to the next multiple of 100 above the current count
         progress["next_milestone"] = ((len(discovered) // 100) + 1) * 100
 
-    # Recurse into content links (index tables already excluded above)
+    # Recurse into content links (footer nav tables already excluded above)
     for child_url in extract_links_for_discovery(BeautifulSoup(html, "lxml")):
-        if child_url not in discovered:
+        if child_url not in visited:
             await crawl(
                 client=client, sem=sem, last_t=last_t,
                 url=child_url, parent_crumb=crumb_for_children,
                 base_category=base_category, discovered=discovered,
-                no_crumb=no_crumb, progress=progress,
+                visited=visited, no_crumb=no_crumb, progress=progress,
                 limit_target=limit_target, verbose=verbose,
                 depth=depth + 1,
             )
@@ -225,6 +259,10 @@ async def discover(
     # URLs (keyed by URL) without disturbing the others.
     discovered: dict[str, str] = _load_existing_manifest()
     no_crumb: set[str] = _load_existing_no_crumb()
+    # Per-run cycle guard, deliberately NOT pre-loaded from the manifest: on a
+    # re-run we want to re-walk known pages (the manifest only dedups the OUTPUT),
+    # so an improved link filter can surface newly-reachable children.
+    visited: set[str] = set()
 
     if discovered:
         console.print(
@@ -262,7 +300,7 @@ async def discover(
                 client=client, sem=sem, last_t=last_t,
                 url=entry_url, parent_crumb=[],
                 base_category=base_category, discovered=discovered,
-                no_crumb=no_crumb, progress=progress,
+                visited=visited, no_crumb=no_crumb, progress=progress,
                 limit_target=limit_target, verbose=verbose, depth=0,
             )
             console.print(f"  → {len(discovered) - before} new pages under {path}")

@@ -42,11 +42,11 @@ def format_context(chunks: list["RetrievedChunk"], max_chars: int = 6000) -> str
 
     blocks: list[str] = []
     total = 0
-    for i, c in enumerate(chunks, 1):
+    for c in chunks:
         src = c.title
         if c.section_heading and c.section_heading.lower() != "overview":
             src += f" · {c.section_heading}"
-        block = f"[{i}] {src}\n{c.raw_text}"
+        block = f"=== {src} ===\n{c.raw_text}"
         if total + len(block) > max_chars:
             break
         blocks.append(block)
@@ -81,6 +81,11 @@ _NON_VISUAL_TITLE_HINTS = (
     "stats", "comparison", "calculating", "motion values", "damage",
     "status effects", "poise", "hemorrhage", "skills", "level", "hp",
     "upgrades", "patch notes", "controls", "builds",
+    "walkthrough", "route", "progress route", "game progress",
+    # Category/index hub pages — images are generic wiki graphics, not visual subjects
+    "bosses", "items", "locations", "weapons", "npcs", "npc",
+    "armor", "shields", "sorceries", "incantations", "talismans",
+    "ashes of war", "spells",
 )
 
 
@@ -179,13 +184,15 @@ stats, or steps that aren't supported there.
 player might ask instead — don't guess.
 - Be well-organized and concise. Use short paragraphs or tight lists for steps, \
 drops, or locations.
-- Write naturally; do NOT insert bracketed source numbers or citations in your \
-prose (the interface shows sources separately).
-- The interface AUTOMATICALLY displays relevant images (of bosses, items, \
-locations, NPCs) alongside your answer. So never say you "can't show images" or \
-that you are "text-only" — you are not. If the player asks to see something, \
-describe it normally; the images appear on their own. Simply answer as if the \
-pictures are shown beside your words.
+- Your response must be pure answer prose. Do NOT reference context passage \
+numbers (e.g. never write "[1]", "passage [2]", "according to context [3]", \
+"the context passage you're referring to is [N]", or any similar phrasing). \
+The interface shows sources as separate cards — never mention them in your text.
+- Do NOT write image placeholders, image captions, or any phrase about where \
+an image appears (e.g. never write "[Image of X appears here]", \
+"[image appears here]", "see image below", etc.). The interface handles image \
+display entirely automatically — your answer text must contain only prose, \
+with no image annotations of any kind.
 - Stay in a clear, informative register — no purple prose."""
 
 
@@ -204,9 +211,11 @@ weight of it all. You may open with address such as "Ah, Tarnished…" when it \
 fits.
 - Embrace the fragmentary nature of this lore — gesture at mystery where the \
 context leaves gaps, rather than inventing answers.
-- Do NOT insert bracketed citations; the interface shows sources separately.
-- The interface automatically displays relevant images alongside your words — \
-never claim you cannot show images or that you are text-only.
+- Do NOT reference context passage numbers (e.g. never write "[1]", "passage \
+[2]", or "the context passage you're referring to is [N]"). The interface shows \
+sources as separate cards — never mention them in your text.
+- Do NOT write image placeholders or annotations of any kind (e.g. never write \
+"[Image of X appears here]"). The interface displays images automatically.
 - If the context holds nothing relevant, say so in voice — admit the threads of \
 this tale lie beyond your sight."""
 
@@ -223,9 +232,11 @@ Tarnished", no roleplay framing, no excessive archaism. The mystery comes from \
 the lore itself, not from affectation.
 - Where the context leaves gaps, acknowledge the uncertainty rather than filling \
 it with invention.
-- Do NOT insert bracketed citations; the interface shows sources separately.
-- The interface automatically displays relevant images alongside your words — \
-never claim you cannot show images or that you are text-only.
+- Do NOT reference context passage numbers (e.g. never write "[1]", "passage \
+[2]", or "the context passage you're referring to is [N]"). The interface shows \
+sources as separate cards — never mention them in your text.
+- Do NOT write image placeholders or annotations of any kind (e.g. never write \
+"[Image of X appears here]"). The interface displays images automatically.
 - If the context holds nothing relevant, say so plainly but in keeping with the \
 reflective tone."""
 
@@ -259,7 +270,7 @@ def build_messages(
     human_parts = []
     if history:
         human_parts.append(f"Recent conversation:\n{history}\n")
-    human_parts.append(f"Context passages:\n{context}\n")
+    human_parts.append(f"Wiki reference material:\n{context}\n")
     human_parts.append(f"Player's question: {question}")
     human = "\n".join(human_parts)
 

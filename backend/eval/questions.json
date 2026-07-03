@@ -1,0 +1,40 @@
+[
+  {"id": "drops_radahn",    "question": "What does Radahn drop?",                              "category": "drops",       "expected_entity": "Starscourge Radahn",          "expected_intent": "drops"},
+  {"id": "drops_malenia",   "question": "What does Malenia drop?",                             "category": "drops",       "expected_entity": "Malenia Blade of Miquella",   "expected_intent": "drops"},
+  {"id": "drops_godrick",   "question": "What does Godrick drop?",                             "category": "drops",       "expected_entity": "Godrick the Grafted",         "expected_intent": "drops"},
+  {"id": "drops_fire_giant","question": "What does the Fire Giant drop?",                      "category": "drops",       "expected_entity": "Fire Giant",                  "expected_intent": "drops"},
+
+  {"id": "strat_malenia",   "question": "How do I beat Malenia?",                              "category": "strategy",    "expected_entity": "Malenia Blade of Miquella",   "expected_intent": "strategy"},
+  {"id": "strat_margit",    "question": "How do I beat Margit the Fell Omen?",                 "category": "strategy",    "expected_entity": "Margit the Fell Omen",        "expected_intent": "strategy"},
+  {"id": "strat_radahn",    "question": "What are the best tips to defeat Starscourge Radahn?","category": "strategy",    "expected_entity": "Starscourge Radahn",          "expected_intent": "strategy"},
+  {"id": "strat_rennala",   "question": "How do I defeat Rennala Queen of the Full Moon?",    "category": "strategy",    "expected_entity": "Rennala Queen of the Full Moon","expected_intent": "strategy"},
+
+  {"id": "loc_meteorite",   "question": "Where can I find the Meteorite Staff?",               "category": "location",    "expected_entity": "Meteorite Staff",             "expected_intent": "location"},
+  {"id": "loc_alexander",   "question": "Where is Alexander the Iron Fist?",                   "category": "location",    "expected_entity": "Iron Fist Alexander",         "expected_intent": "location"},
+  {"id": "loc_nokron",      "question": "How do I get to Nokron Eternal City?",                "category": "location",    "expected_entity": "Nokron, the Eternal City",    "expected_intent": "location"},
+  {"id": "loc_moonveil",    "question": "Where can I find the Moonveil katana?",               "category": "location",    "expected_entity": "Moonveil",                    "expected_intent": "location", "notes": "known data gap — may not be in corpus"},
+
+  {"id": "lore_marika",     "question": "Tell me the story of Queen Marika.",                  "category": "lore",        "expected_entity": "Queen Marika",                "expected_intent": "lore"},
+  {"id": "lore_ranni",      "question": "Who is Ranni the Witch?",                             "category": "lore",        "expected_entity": "Ranni the Witch",             "expected_intent": "lore"},
+  {"id": "lore_godwyn",     "question": "What happened to Godwyn the Golden?",                 "category": "lore",        "expected_entity": "Godwyn the Golden",           "expected_intent": "lore"},
+  {"id": "lore_elden_ring", "question": "What is the Elden Ring and what happened to it?",     "category": "lore",        "expected_entity": "",                            "expected_intent": "lore"},
+
+  {"id": "quest_ranni",     "question": "How do I progress Ranni's questline?",                "category": "quest",       "expected_entity": "Ranni the Witch",             "expected_intent": "quest"},
+  {"id": "quest_fia",       "question": "How do I complete Fia's questline?",                  "category": "quest",       "expected_entity": "Fia",                         "expected_intent": "quest"},
+  {"id": "quest_alexander", "question": "How do I advance Alexander's questline?",             "category": "quest",       "expected_entity": "Iron Fist Alexander",         "expected_intent": "quest"},
+
+  {"id": "dial_ranni",      "question": "What does Ranni say when you first meet her?",        "category": "dialogue",    "expected_entity": "Ranni the Witch",             "expected_intent": "dialogue"},
+  {"id": "dial_melina",     "question": "What does Melina say about the Two Fingers?",         "category": "dialogue",    "expected_entity": "Melina",                      "expected_intent": "dialogue"},
+
+  {"id": "ambig_greatsword","question": "Where can I find the Greatsword?",                    "category": "ambiguous",   "expected_entity": "Greatsword",                  "expected_intent": "location"},
+  {"id": "ambig_swords",    "question": "What are the best swords in Elden Ring?",             "category": "ambiguous",   "expected_entity": "",                            "expected_intent": ""},
+
+  {"id": "typo_malenia",    "question": "How do I beat Melania?",                              "category": "misspell",    "expected_entity": "Malenia Blade of Miquella",   "expected_intent": "strategy"},
+  {"id": "typo_morgott",    "question": "Where do I fight Morgot the Omen King?",              "category": "misspell",    "expected_entity": "Morgott the Omen King",       "expected_intent": "location"},
+
+  {"id": "summ_great_runes","question": "How many Great Runes are there in Elden Ring?",       "category": "summary",     "expected_entity": "",                            "expected_intent": "summary"},
+  {"id": "summ_legacy_dung","question": "What are all the legacy dungeons in Elden Ring?",     "category": "summary",     "expected_entity": "",                            "expected_intent": "summary"},
+
+  {"id": "chat_hello",      "question": "Hello, I just started playing Elden Ring!",           "category": "no_retrieval","expected_entity": "",                            "expected_intent": ""},
+  {"id": "chat_help",       "question": "What kind of questions can you help me with?",        "category": "no_retrieval","expected_entity": "",                            "expected_intent": ""}
+]

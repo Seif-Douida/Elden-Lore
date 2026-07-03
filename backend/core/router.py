@@ -39,7 +39,7 @@ from core.llm import get_router_llm
 from core.entity_resolver import EntityResolver
 
 # Intent values MUST match the retriever's INTENT_PROFILES keys.
-IntentT    = Literal["drops", "strategy", "location", "dialogue", "lore", "quest"]
+IntentT    = Literal["drops", "strategy", "location", "dialogue", "lore", "quest", "summary"]
 ChunkTypeT = Literal["body", "dialogue", "item_desc"]
 CategoryT  = Literal["lore", "item", "boss", "quest", "location"]
 ToneT      = Literal["scholar", "cryptic"]
@@ -90,17 +90,20 @@ class RouterDecision(BaseModel):
         description="'cryptic' for lore/story questions wanting an evocative "
                     "Soulslike voice; 'scholar' for direct factual help.",
     )
+    retrieval_query: Optional[str] = Field(
+        default=None,
+        description="Focused search query for embedding, with user-context noise "
+                    "removed. Use ONLY when the question contains context about what "
+                    "the user is currently doing (where they are, what they just did, "
+                    "what item they have) that is NOT the lookup target. Write just "
+                    "the core information need. "
+                    "Example: 'I am in the mountain top of the giants, how do I reach "
+                    "Mohgwyn Palace?' → 'How to reach Mohgwyn Palace'. "
+                    "Leave null if the question itself is the lookup (no context noise).",
+    )
 
 
 # ── Call 2 schema ─────────────────────────────────────────────────────────────
-
-class MentionSelection(BaseModel):
-    mention: str = Field(description="The user mention being resolved, verbatim.")
-    choice_index: int = Field(
-        description="1-based index of the chosen candidate from that mention's "
-                    "numbered list; 0 if none of the candidates is correct.",
-    )
-
 
 class EntityChoice(BaseModel):
     """
@@ -109,11 +112,14 @@ class EntityChoice(BaseModel):
     an off-list/paraphrased entity (the failure we hit with name-based output,
     where the model 'helpfully' returned 'Queen Marika the Eternal' instead of
     an exact candidate). Use 0 to mean "none of these fit".
+
+    Flat dict format (mention → index) is used because nested object lists
+    (list[MentionSelection]) caused small models to return empty selections.
     """
-    selections: list[MentionSelection] = Field(
-        default_factory=list,
-        description="One entry per mention, with the 1-based index of the best "
-                    "candidate (or 0 if none fit).",
+    indices: dict[str, int] = Field(
+        default_factory=dict,
+        description="For each mention (key), the 1-based index of the best "
+                    "matching candidate from its numbered list. Use 0 if none fit.",
     )
 
 
@@ -128,6 +134,7 @@ class ResolvedDecision:
     category_hint: Optional[str]
     needs_image: bool
     tone: str
+    retrieval_query: Optional[str]   # focused embed query, strips context noise
     # Diagnostics
     raw_mentions: list[str]
     resolution_debug: dict
@@ -144,21 +151,46 @@ user's question and produce a structured retrieval plan.
 
 Guidance:
 - entity_mentions: copy proper nouns EXACTLY as the user wrote them, including \
-misspellings. Do not correct them. ("Melania" stays "Melania".)
+misspellings. Do not correct them. ("Melania" stays "Melania".) Include any \
+specific named weapon, item, NPC, boss, or location — even if the name also \
+sounds like a category (e.g. "the Greatsword", "a Longsword", "the Talisman" \
+are all entity mentions when the user is clearly asking about a specific named \
+thing, not asking generically about the weapon class). Use capitalisation and \
+the presence of "the" as signals that a specific named item is meant. \
+Named LOCATIONS are also entity mentions — "Nokron Eternal City", \
+"Stormveil Castle", "Leyndell", "Caelid", "Siofra River" are all entities \
+even when the question is about how to reach them.
 - needs_retrieval is false only for pure greetings/smalltalk.
 - intent: pick the single best fit. "what does X drop" -> drops; "how do I beat \
-X" -> strategy; "where is X" -> location; "what does X say" -> dialogue; \
-"who is X / story of X" -> lore; "how do I progress X's quest" -> quest.
+X" -> strategy; "help me build a X build / what stats for X build" -> strategy; \
+"where is X / where can I find X / how do I get to X" -> location; \
+"what does X say" -> dialogue; "who is X / story of X / tell me about X" -> lore; \
+"how do I progress/complete X's quest / guide me through X" -> quest; \
+"how do I get the X ending / I want to achieve the X ending" -> quest; \
+"how many X / list all X / what are all the X" (count or enumerate) -> summary.
 - tone: 'cryptic' only when the user wants lore/story atmosphere; else 'scholar'.
+- retrieval_query: if the user includes personal context ("I am in X", "I just beat X", \
+"I have item X", "After doing X") that is NOT the lookup target, write a clean search \
+query for just the core question — omit the context clause. Leave null otherwise.
 Be decisive and concise."""
 
 CALL2_SYSTEM = """You disambiguate Elden Ring entity names. For each mention you \
-are given a NUMBERED list of candidate names. Choose the single candidate the \
-user most likely meant, using the question for context, and return its NUMBER. \
-If none of the candidates is correct, return 0 for that mention.
+are given a NUMBERED list of candidate names. Choose the single best match and \
+return its NUMBER as the value for that mention's key in the "indices" dict. \
+Use 0 only if NONE of the candidates could be what the user meant.
 
-You MUST choose by number from the list provided. Do not write entity names — \
-only the index numbers. Example: if candidate 2 is correct, return choice_index 2."""
+Rules:
+- If a candidate's name exactly matches the mention (e.g. mention "Fia", \
+candidate 1 is "Fia") — choose that candidate, do NOT return 0.
+- For "drops/what does X drop" questions, the entity is the boss or enemy \
+being fought, NOT an item. Prefer the boss/character candidate.
+- For "strategy/how to beat" questions, prefer the boss entity.
+- For "location/where" questions, prefer the place or NPC being located.
+
+You MUST return the "indices" dict with one entry per mention. \
+Return only index numbers — never write entity names as values. \
+Example: if the mention is "Radahn" and candidate 2 "Starscourge Radahn" is \
+the best match, return {"indices": {"Radahn": 2}}."""
 
 
 # ── Router ────────────────────────────────────────────────────────────────────
@@ -192,11 +224,17 @@ class Router:
             if not cands:
                 continue
             top_name, top_score = cands[0]
-            # Auto-accept: only one candidate, or a clearly dominant top score.
+            gap = top_score - cands[1][1] if len(cands) >= 2 else 100.0
+            # Auto-accept when the top candidate is clearly dominant:
+            #   - only one candidate
+            #   - very high score (≥95) with a meaningful gap (≥5): catches
+            #     cases like "milady sword"→Milady(100)/swords(90.9) without
+            #     a model call, while still sending true ties (gap<5) to Call 2
+            #   - standard threshold (≥90) with a large gap (≥10)
             dominant = (
                 len(cands) == 1
-                or (top_score >= AUTOACCEPT_SCORE and
-                    (len(cands) < 2 or top_score - cands[1][1] >= 10))
+                or (top_score >= 95.0 and gap >= 5)
+                or (top_score >= AUTOACCEPT_SCORE and gap >= 10)
             )
             if dominant:
                 entity_focus.append(top_name)
@@ -222,25 +260,56 @@ class Router:
                 [("system", CALL2_SYSTEM), ("human", prompt)]
             )
 
-            # Map each (mention, index) back to the EXACT candidate string.
+            # Map each (mention → index) back to the EXACT candidate string.
             accepted, rejected = [], []
-            for sel in choice.selections:
-                cands = ambiguous.get(sel.mention)
-                if cands is None:
-                    # mention key drifted; try a tolerant match
-                    key = next((k for k in ambiguous if _norm(k) == _norm(sel.mention)), None)
-                    cands = ambiguous.get(key) if key else None
-                if cands and 1 <= sel.choice_index <= len(cands):
-                    accepted.append(cands[sel.choice_index - 1])
-                else:
-                    rejected.append((sel.mention, sel.choice_index))
+            raw_indices = choice.indices  # dict[str, int]
+
+            # Fallback: if the model returned nothing, use top candidate per mention.
+            if not raw_indices:
+                for mention, cands in ambiguous.items():
+                    if cands:
+                        accepted.append(cands[0])
+                call2_debug = {
+                    "shortlist_sent": ambiguous,
+                    "raw_indices": {},
+                    "accepted": accepted,
+                    "rejected": [],
+                    "fallback": "empty_indices",
+                }
+            else:
+                for mention, cands in ambiguous.items():
+                    # Tolerate key drift (whitespace/case differences).
+                    idx = raw_indices.get(mention)
+                    if idx is None:
+                        key = next((k for k in raw_indices if _norm(k) == _norm(mention)), None)
+                        idx = raw_indices.get(key) if key else None
+                    if idx is not None and 1 <= idx <= len(cands):
+                        accepted.append(cands[idx - 1])
+                    elif idx == 0:
+                        # LLM says "none fit" — if mention literally IS a candidate
+                        # (e.g. "Fia" == "Fia"), trust that exact match over the refusal.
+                        exact_i = next(
+                            (i for i, c in enumerate(cands) if _norm(c) == _norm(mention)),
+                            None,
+                        )
+                        if exact_i is not None:
+                            accepted.append(cands[exact_i])
+                        else:
+                            rejected.append((mention, idx))
+                    else:
+                        # Bad/out-of-range or None index → fall back to top candidate
+                        if cands:
+                            accepted.append(cands[0])
+                        else:
+                            rejected.append((mention, idx))
+                call2_debug = {
+                    "shortlist_sent": ambiguous,
+                    "raw_indices": raw_indices,
+                    "accepted": accepted,
+                    "rejected": rejected,
+                }
+
             entity_focus.extend(accepted)
-            call2_debug = {
-                "shortlist_sent": ambiguous,
-                "raw_selections": [(s.mention, s.choice_index) for s in choice.selections],
-                "accepted": accepted,
-                "rejected": rejected,
-            }
 
         # De-dup while preserving order
         seen = set()
@@ -257,6 +326,7 @@ class Router:
             category_hint=decision.category_hint,
             needs_image=decision.needs_image,
             tone=decision.tone,
+            retrieval_query=decision.retrieval_query or None,
             raw_mentions=decision.entity_mentions,
             resolution_debug=resolution_debug,
             used_call2=used_call2,

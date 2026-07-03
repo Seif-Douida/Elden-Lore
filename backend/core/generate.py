@@ -96,7 +96,7 @@ class Generator:
     def assemble_metadata(result: PipelineResult) -> tuple[list[dict], list[dict]]:
         sources = format_sources(result.chunks) if result.chunks else []
         images: list[dict] = []
-        if result.decision.needs_image and result.chunks:
+        if result.chunks:
             images = select_images(
                 result.chunks,
                 entity_focus=result.decision.entity_focus,

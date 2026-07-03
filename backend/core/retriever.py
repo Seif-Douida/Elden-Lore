@@ -95,6 +95,12 @@ INTENT_PROFILES: dict[str, dict[str, set[str]]] = {
         "crumb":       {"npcs", "walkthrough"},
         "chunk_types": set(),
     },
+    "summary": {
+        "sections":    {"overview", "list", "all bosses", "main bosses",
+                        "achievement", "complete list", "full list", "all"},
+        "crumb":       set(),
+        "chunk_types": {"body", "item_desc"},
+    },
 }
 VALID_INTENTS = sorted(INTENT_PROFILES.keys())
 
