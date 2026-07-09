@@ -59,6 +59,15 @@ def auto_score(q: dict, result, chunks: list, answer: str) -> dict:
     if exp_intent:
         intent_hit = result.decision.intent == exp_intent
 
+    # Enumeration: did the router set the right category AND did the metadata roster
+    # actually populate? (validates the "how many / list all X" path end-to-end)
+    exp_enum = q.get("expected_enumerate_group", "")
+    enumerate_hit: Optional[bool] = None
+    if exp_enum:
+        got_enum = result.decision.enumerate_group or ""
+        enumerate_hit = (_norm(exp_enum) == _norm(got_enum)
+                         and len(getattr(result, "roster", [])) > 0)
+
     top1_title_match: Optional[bool] = None
     if chunks and exp_entity:
         top1_title_match = _norm(exp_entity) in _norm(chunks[0].title)
@@ -75,6 +84,7 @@ def auto_score(q: dict, result, chunks: list, answer: str) -> dict:
     return {
         "entity_hit": entity_hit,
         "intent_hit": intent_hit,
+        "enumerate_hit": enumerate_hit,
         "top1_title_match": top1_title_match,
         "top3_entity_coverage": top3_coverage,
         "entity_fallback_used": result.entity_fallback,
@@ -112,7 +122,7 @@ def llm_judge(question: str, answer: str, llm) -> dict:
 # ── Per-question run ──────────────────────────────────────────────────────────
 
 _ERROR_SCORES: dict = {
-    "entity_hit": None, "intent_hit": None, "top1_title_match": None,
+    "entity_hit": None, "intent_hit": None, "enumerate_hit": None, "top1_title_match": None,
     "top3_entity_coverage": None, "entity_fallback_used": False,
     "answer_mentions_entity": None, "chunks_returned": 0,
 }
@@ -227,11 +237,13 @@ def build_markdown(results: list[dict], judge_mode: bool) -> str:
     # Overall summary
     all_entity = [r["auto_scores"]["entity_hit"] for r in results if r["auto_scores"]["entity_hit"] is not None]
     all_intent = [r["auto_scores"]["intent_hit"] for r in results if r["auto_scores"]["intent_hit"] is not None]
+    all_enum   = [r["auto_scores"].get("enumerate_hit") for r in results if r["auto_scores"].get("enumerate_hit") is not None]
     all_top1   = [r["auto_scores"]["top1_title_match"] for r in results if r["auto_scores"]["top1_title_match"] is not None]
+    _enum = f" | enumerate {sum(all_enum)}/{len(all_enum)}" if all_enum else ""
     lines.append(
         f"**Overall** — entity_hit {sum(all_entity)}/{len(all_entity)} "
         f"| intent_hit {sum(all_intent)}/{len(all_intent)} "
-        f"| top1_match {sum(all_top1)}/{len(all_top1)}\n"
+        f"| top1_match {sum(all_top1)}/{len(all_top1)}{_enum}\n"
     )
 
     for cat, rs in sorted(by_cat.items()):
@@ -383,6 +395,8 @@ def main() -> None:
         elif s["entity_hit"] is False: bits.append("entity:FAIL")
         if s["intent_hit"] is True:    bits.append("intent:OK")
         elif s["intent_hit"] is False: bits.append("intent:FAIL")
+        if s.get("enumerate_hit") is True:    bits.append("enum:OK")
+        elif s.get("enumerate_hit") is False: bits.append("enum:FAIL")
         if s["top1_title_match"] is True:    bits.append("top1:OK")
         elif s["top1_title_match"] is False: bits.append("top1:FAIL")
         if s["entity_fallback_used"]: bits.append("FALLBACK")

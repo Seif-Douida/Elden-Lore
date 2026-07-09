@@ -35,6 +35,37 @@ _NO_CONTEXT_FALLBACK = (
 )
 
 
+def _chunk_text(chunk) -> str:
+    """Normalize a streamed chunk's content to a plain string. Gemini/Gemma can
+    return `content` as a str OR a list of content blocks (str or {'type':'text',
+    'text':...}); the list form broke '"".join(parts)' downstream. Always coerce."""
+    c = getattr(chunk, "content", "")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        out = []
+        for b in c:
+            if isinstance(b, str):
+                out.append(b)
+            elif isinstance(b, dict):
+                out.append(b.get("text") or b.get("content") or "")
+        return "".join(out)
+    return str(c) if c else ""
+
+
+def _extract_model(chunk) -> Optional[str]:
+    """Best-effort: which model produced this streamed chunk (after any fallback).
+    Provider metadata varies, so check the usual spots and take the first hit."""
+    for src in (getattr(chunk, "response_metadata", None),
+                getattr(chunk, "additional_kwargs", None)):
+        if isinstance(src, dict):
+            for key in ("model_name", "model"):
+                v = src.get(key)
+                if v:
+                    return str(v)
+    return None
+
+
 @dataclass
 class GenerationResult:
     """Everything the UI needs: the answer text, sources, images, and metadata."""
@@ -51,11 +82,13 @@ class Generator:
         self._llm = get_chat_llm()
 
     # ── streaming (pure) ─────────────────────────────────────────────────────
-    def stream(self, result: PipelineResult,
-               history: Optional[str] = None) -> Iterator[str]:
+    def stream(self, result: PipelineResult, history: Optional[str] = None,
+               trace: Optional[dict] = None) -> Iterator[str]:
         """
-        Yield answer tokens for a PipelineResult. The future SSE endpoint wraps
-        this directly.
+        Yield answer tokens for a PipelineResult. The SSE endpoints wrap this
+        directly. Pass a mutable `trace` dict to capture which model actually
+        answered (after any fallback) as trace["model"] — read it once the
+        generator is exhausted.
         """
         decision = result.decision
         tone = decision.tone
@@ -69,14 +102,13 @@ class Generator:
                  "and warmly, and invite them to ask about the game."),
                 ("human", result.question),
             ]
-            for chunk in self._llm.stream(messages):
-                text = getattr(chunk, "content", "")
-                if text:
-                    yield text
+            yield from self._stream_llm(messages, trace)
             return
 
         # Retrieved but empty → don't invoke the LLM on nothing; give guidance.
         if not result.chunks:
+            if trace is not None:
+                trace["model"] = "none:no-context-fallback"
             yield _NO_CONTEXT_FALLBACK
             return
 
@@ -85,23 +117,73 @@ class Generator:
             chunks=result.chunks,
             tone=tone,
             history=history,
+            enumerate_group=decision.enumerate_group,
+            roster=result.roster,
         )
+        yield from self._stream_llm(messages, trace)
+
+    def _stream_llm(self, messages, trace: Optional[dict]) -> Iterator[str]:
+        """Stream tokens from the chat chain, recording the answering model."""
         for chunk in self._llm.stream(messages):
-            text = getattr(chunk, "content", "")
+            if trace is not None and "model" not in trace:
+                m = _extract_model(chunk)
+                if m:
+                    trace["model"] = m
+            text = _chunk_text(chunk)
             if text:
                 yield text
 
     # ── metadata (sources + images) ──────────────────────────────────────────
     @staticmethod
-    def assemble_metadata(result: PipelineResult) -> tuple[list[dict], list[dict]]:
-        sources = format_sources(result.chunks) if result.chunks else []
-        images: list[dict] = []
-        if result.chunks:
-            images = select_images(
-                result.chunks,
-                entity_focus=result.decision.entity_focus,
-            )
+    def assemble_metadata(
+        result: PipelineResult, answer_text: Optional[str] = None,
+    ) -> tuple[list[dict], list[dict]]:
+        """
+        Build source cards + images for the UI. Pass the generated `answer_text`
+        so media is gated to what the answer actually references (drops tangential
+        images/sources and clears them on refusals).
+        """
+        if not result.chunks:
+            return [], []
+        sources = format_sources(
+            result.chunks,
+            entity_focus=result.decision.entity_focus,
+            answer_text=answer_text,
+        )
+        images = select_images(
+            result.chunks,
+            entity_focus=result.decision.entity_focus,
+            answer_text=answer_text,
+        )
         return sources, images
+
+
+def answer_stats(result: PipelineResult, model: Optional[str],
+                 extra_timings: dict) -> dict:
+    """
+    One flat dict summarising a request for structured logging + the SSE `done`
+    event: which model answered, routing decision, retrieval shape, and the full
+    timing breakdown (pipeline's router_ms/retrieval_ms merged with the caller's
+    ttft_ms/gen_ms/total_ms).
+    """
+    d = result.decision
+    top = [
+        {"title": c.title, "score": round(c.final_score if c.boost else c.score, 3)}
+        for c in result.chunks[:3]
+    ]
+    return {
+        "model": model,
+        "intent": d.intent,
+        "tone": d.tone,
+        "entity_focus": d.entity_focus,
+        "entity_fallback": result.entity_fallback,
+        "used_retrieval": result.retrieved,
+        "chunk_count": len(result.chunks),
+        "enumerate_group": d.enumerate_group,
+        "roster_count": len(result.roster),
+        "top_chunks": top,
+        "timings": {**result.timings, **extra_timings},
+    }
 
 
 # ── Full-stack convenience runner ─────────────────────────────────────────────
@@ -123,7 +205,7 @@ class Assistant:
         """Non-streaming convenience: collects the stream and bundles metadata."""
         result = self._pipeline.run(question, history=history, k=k)
         text = "".join(self._generator.stream(result, history=history))
-        sources, images = Generator.assemble_metadata(result)
+        sources, images = Generator.assemble_metadata(result, answer_text=text)
         return GenerationResult(
             answer=text,
             sources=sources,
@@ -157,11 +239,13 @@ def main() -> None:
     console.print(f"[dim](tone={result.decision.tone}, "
                   f"chunks={len(result.chunks)}, "
                   f"fallback={result.entity_fallback})[/dim]\n")
+    parts: list[str] = []
     for token in assistant._generator.stream(result):
+        parts.append(token)
         console.print(token, end="")
     console.print()
 
-    sources, images = Generator.assemble_metadata(result)
+    sources, images = Generator.assemble_metadata(result, answer_text="".join(parts))
     if sources:
         console.print("\n[bold]Sources:[/bold]")
         for s in sources[:5]:

@@ -11,6 +11,9 @@ wheels/
 
 # Secrets
 .env
+# Cloud Run deploy env file (holds keys + DATABASE_URL; never commit)
+env.yaml
+env.*.yaml
 
 # Qdrant Docker named volume (lives in WSL2, not the repo)
 qdrant_storage

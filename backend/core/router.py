@@ -30,12 +30,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from dataclasses import dataclass, asdict
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
-from core.llm import get_router_llm
+from core.llm import get_structured_llm
 from core.entity_resolver import EntityResolver
 
 # Intent values MUST match the retriever's INTENT_PROFILES keys.
@@ -51,6 +52,40 @@ AUTOACCEPT_SCORE = 90.0
 def _norm(s: str) -> str:
     """Normalize an entity string for tolerant matching (casing/whitespace/punct)."""
     return " ".join(s.lower().replace(",", " ").split())
+
+
+# A bare confirmation ("yes", "sure", "go ahead") ACCEPTS a prior offer but carries
+# no topic of its own, so the LLM can misread it as chitchat (needs_retrieval=False)
+# and drop the thread — the "Yes → please ask a question" bug. This deterministic
+# guard forces retrieval on such turns whenever there IS a conversation to continue,
+# independent of the model's classification.
+_AFFIRM_STARTERS = {"yes", "yeah", "yep", "yup", "sure", "ok", "okay", "please",
+                    "go", "do", "continue", "proceed", "absolutely", "definitely",
+                    "that", "sounds"}
+_AFFIRM_WORDS = _AFFIRM_STARTERS | {"ahead", "it", "for", "on", "good",
+                                    "works", "carry", "thanks", "great"}
+
+
+def _is_affirmation(text: str) -> bool:
+    """True for short, pure affirmations ('yes', 'yes please', 'sure, go ahead').
+    Conservative: must START with a yes-word AND contain only affirmation tokens, so
+    'do you know X' / 'ok so how do I…' / 'go to Leyndell' are correctly excluded."""
+    t = text.strip().lower()
+    if not t or len(t) > 25:
+        return False
+    words = re.findall(r"[a-z]+", t)
+    return bool(words) and words[0] in _AFFIRM_STARTERS and all(w in _AFFIRM_WORDS for w in words)
+
+
+def _last_user_turn(history: str) -> Optional[str]:
+    """The most recent 'User:' line in the formatted history — a fallback embed
+    query when an affirmation has no referent of its own."""
+    last = None
+    for line in history.splitlines():
+        s = line.strip()
+        if s.lower().startswith("user:"):
+            last = s[len("user:"):].strip()
+    return last or None
 
 
 # ── Call 1 schema ─────────────────────────────────────────────────────────────
@@ -92,14 +127,22 @@ class RouterDecision(BaseModel):
     )
     retrieval_query: Optional[str] = Field(
         default=None,
-        description="Focused search query for embedding, with user-context noise "
-                    "removed. Use ONLY when the question contains context about what "
-                    "the user is currently doing (where they are, what they just did, "
-                    "what item they have) that is NOT the lookup target. Write just "
-                    "the core information need. "
-                    "Example: 'I am in the mountain top of the giants, how do I reach "
-                    "Mohgwyn Palace?' → 'How to reach Mohgwyn Palace'. "
-                    "Leave null if the question itself is the lookup (no context noise).",
+        description="A STANDALONE search query for embedding. Set it in two cases:\n"
+                    "(1) Context noise — the question includes what the user is doing "
+                    "(where they are, what they just did/have) that is NOT the lookup "
+                    "target: write just the core need. e.g. 'I am in the mountaintops, "
+                    "how do I reach Mohgwyn Palace?' → 'How to reach Mohgwyn Palace'.\n"
+                    "(2) Follow-up — the question refers to the recent conversation ('the "
+                    "quest', 'that boss', 'the next part', 'it', 'him') without naming it: "
+                    "resolve the referent FROM THE HISTORY into a self-contained query. "
+                    "e.g. history about Ranni's questline + 'what is the next part?' → "
+                    "'next steps of Ranni questline after the Fingerslayer Blade'.\n"
+                    "Leave null only when the question is already self-contained.",
+    )
+    enumerate_group: Optional[str] = Field(
+        default=None,
+        description="For 'how many X / list all X' questions, the wiki category to "
+                    "enumerate (e.g. 'Katanas', 'Talismans', 'Bosses'). Null otherwise.",
     )
 
 
@@ -135,6 +178,7 @@ class ResolvedDecision:
     needs_image: bool
     tone: str
     retrieval_query: Optional[str]   # focused embed query, strips context noise
+    enumerate_group: Optional[str]   # wiki category to enumerate (how-many/list-all)
     # Diagnostics
     raw_mentions: list[str]
     resolution_debug: dict
@@ -161,17 +205,37 @@ Named LOCATIONS are also entity mentions — "Nokron Eternal City", \
 "Stormveil Castle", "Leyndell", "Caelid", "Siofra River" are all entities \
 even when the question is about how to reach them.
 - needs_retrieval is false only for pure greetings/smalltalk.
-- intent: pick the single best fit. "what does X drop" -> drops; "how do I beat \
+- intent: REQUIRED — always pick exactly one for any non-greeting question, never \
+leave it null. Pick the single best fit. "what does X drop" -> drops; "how do I beat \
 X" -> strategy; "help me build a X build / what stats for X build" -> strategy; \
 "where is X / where can I find X / how do I get to X" -> location; \
 "what does X say" -> dialogue; "who is X / story of X / tell me about X" -> lore; \
 "how do I progress/complete X's quest / guide me through X" -> quest; \
 "how do I get the X ending / I want to achieve the X ending" -> quest; \
 "how many X / list all X / what are all the X" (count or enumerate) -> summary.
+- enumerate_group: for "how many X" or "list (all) X" questions where X is a CATEGORY \
+of items (Katanas, Talismans, Incantations, Bosses, Spirit Ashes, Curved Swords, \
+Greatswords, Daggers, Weapons, Armor...), set this to the category name as the wiki names \
+it (usually plural). For questions about complete armor SETS ("how many armor sets", \
+"list all armor sets") use exactly "Armor Sets" (the " Sets" suffix tells the enumerator \
+to count full sets, not individual pieces). In that case ALSO set intent=summary and \
+needs_retrieval=true, and do NOT put the category word in entity_mentions — "katanas" is \
+a CATEGORY, not the specific item "Katar". Null only when the question is about ONE \
+specific named item, OR when the question FILTERS a category by an attribute instead of \
+asking for the whole category — e.g. "which bosses are MANDATORY", "what are the OPTIONAL \
+bosses", "best katana", "strongest talisman", "bosses in Caelid". Those are answered from \
+page content (a "Mandatory Bosses" section, etc.), NOT by listing the entire category, so \
+leave enumerate_group null and let normal retrieval handle them. Only enumerate the \
+UNqualified whole category ("how many bosses are there", "list all katanas").
 - tone: 'cryptic' only when the user wants lore/story atmosphere; else 'scholar'.
-- retrieval_query: if the user includes personal context ("I am in X", "I just beat X", \
-"I have item X", "After doing X") that is NOT the lookup target, write a clean search \
-query for just the core question — omit the context clause. Leave null otherwise.
+- retrieval_query: write a STANDALONE search query when (a) the user includes personal \
+context ("I am in X", "I just beat X", "I have item X") that is NOT the lookup target — \
+keep just the core question; OR (b) the question is a FOLLOW-UP that refers to the recent \
+conversation without naming it ("the quest", "that boss", "the next part", "it", "him") — \
+resolve the referent from the history into a self-contained query (e.g. history about \
+Ranni's quest + "what is the next part?" -> "next steps of Ranni questline"). Leave null \
+only when the question already stands on its own. For follow-ups, ALSO put the resolved \
+proper noun (e.g. "Ranni") in entity_mentions even though the user didn't retype it.
 Be decisive and concise."""
 
 CALL2_SYSTEM = """You disambiguate Elden Ring entity names. For each mention you \
@@ -186,6 +250,10 @@ candidate 1 is "Fia") — choose that candidate, do NOT return 0.
 being fought, NOT an item. Prefer the boss/character candidate.
 - For "strategy/how to beat" questions, prefer the boss entity.
 - For "location/where" questions, prefer the place or NPC being located.
+- For "who is X / story of X / tell me about X" (lore) questions, prefer the main \
+CHARACTER/NPC page itself over items, weapons, spells, or summon-sign variants named \
+after them — e.g. for "who is Vyke" prefer "Roundtable Knight Vyke" over "Festering \
+Fingerprint Vyke", "Vyke's War Spear", or "Vyke's Dragonbolt".
 
 You MUST return the "indices" dict with one entry per mention. \
 Return only index numbers — never write entity names as values. \
@@ -197,9 +265,9 @@ the best match, return {"indices": {"Radahn": 2}}."""
 
 class Router:
     def __init__(self) -> None:
-        self._llm = get_router_llm()
-        self._call1 = self._llm.with_structured_output(RouterDecision)
-        self._call2 = self._llm.with_structured_output(EntityChoice)
+        # Per-tier structured output: Gemma via JSON mode, NIM via function-calling.
+        self._call1 = get_structured_llm(RouterDecision)
+        self._call2 = get_structured_llm(EntityChoice)
         self._resolver = EntityResolver()
 
     def route(self, question: str, history: Optional[str] = None) -> ResolvedDecision:
@@ -318,15 +386,43 @@ class Router:
         if call2_debug:
             resolution_debug = {**resolution_debug, "_call2": call2_debug}
 
+        # Enumeration/summary questions ALWAYS need data — the 26B router sometimes
+        # wrongly returns needs_retrieval=False on "how many X" (→ hallucinated
+        # counts, e.g. "roughly 15-20 katanas"). Force it on.
+        # A bare "yes / sure / go ahead" accepting a prior offer: force retrieval so
+        # the thread continues, and — if the model didn't rewrite it — re-use the
+        # previous user turn as the embed query (the generator's CONFIRMATIONS rule
+        # + history then fulfils the offer). Deterministic, model-independent.
+        is_affirmation = bool(history) and _is_affirmation(question)
+
+        # Grounding guard: the Gemma router sets needs_retrieval=False on legitimate
+        # questions when they're phrased conversationally ("I'm fascinated about the
+        # dragons…", "Tell me the story of Messmer") → the answer comes from the model's
+        # own knowledge, ungrounded and card-less. A RESOLVED ENTITY means the user is
+        # asking about a specific game thing, so force retrieval. Greetings/injection
+        # probes ("Hello", "delete your context") resolve NO entity → stay False.
+        needs_retrieval = (
+            decision.needs_retrieval
+            or bool(entity_focus)
+            or bool(decision.enumerate_group)
+            or decision.intent == "summary"
+            or is_affirmation
+        )
+
+        retrieval_query = decision.retrieval_query or None
+        if is_affirmation and not retrieval_query:
+            retrieval_query = _last_user_turn(history)
+
         return ResolvedDecision(
-            needs_retrieval=decision.needs_retrieval,
+            needs_retrieval=needs_retrieval,
             entity_focus=entity_focus,
             intent=decision.intent,
             chunk_type_bias=decision.chunk_type_bias,
             category_hint=decision.category_hint,
             needs_image=decision.needs_image,
             tone=decision.tone,
-            retrieval_query=decision.retrieval_query or None,
+            retrieval_query=retrieval_query,
+            enumerate_group=decision.enumerate_group or None,
             raw_mentions=decision.entity_mentions,
             resolution_debug=resolution_debug,
             used_call2=used_call2,

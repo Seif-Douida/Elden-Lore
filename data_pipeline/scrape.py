@@ -33,7 +33,7 @@ import re
 from typing import Optional
 
 import httpx
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 from common import (
@@ -163,6 +163,113 @@ def extract_infobox(soup: BeautifulSoup) -> dict[str, str]:
     return infobox
 
 
+# ── Structured stats (weapon / spell / boss / armor stat cards) ───────────────
+# Fextralife renders stat cards as: a label (text and/or an <img title>) followed
+# by <div class="lineleft"> holding values as <a>Name</a> value pairs — plus plain
+# <td>Label Value</td> cells (FP Cost, Slots Used, Wgt.). The generic body-text
+# extractor drops the SHORT cells (2-attribute scaling, "Weak to X", "FP Cost 7")
+# via its len<20 nav filter, so we parse them structurally here. First clean
+# occurrence of each label wins.
+
+_STAT_GRADES = set("SABCDE")
+_STAT_ATTR = {
+    "str": "str", "strength": "str", "dex": "dex", "dexterity": "dex",
+    "int": "int", "intelligence": "int", "fai": "fai", "faith": "fai",
+    "arc": "arc", "arcane": "arc",
+}
+_STAT_LABELS = {
+    "attack": "attack", "guard": "guard", "scaling": "scaling",
+    "requires": "requires", "weak to": "weak_to", "strong vs": "strong_vs",
+    "resistant": "resistant", "immune to": "immune", "effect": "effect",
+}
+
+
+def _stat_label(div: Tag) -> Optional[str]:
+    """The stat label preceding a div.lineleft — the LAST known label keyword in the
+    text before it (handles both 'Weak to<br><div>' and 'Effect…Requires<div>')."""
+    parts: list[str] = []
+    for node in div.parent.children:
+        if node is div:
+            break
+        if isinstance(node, NavigableString):
+            parts.append(str(node))
+        elif isinstance(node, Tag) and node.name != "img":
+            parts.append(node.get_text(" "))
+    text = re.sub(r"\s+", " ", "".join(parts)).lower()
+    best, pos = None, -1
+    for lab in _STAT_LABELS:
+        i = text.rfind(lab)
+        if i > pos:
+            pos, best = i, lab
+    return best
+
+
+def _lineleft_pairs(div: Tag):
+    """(pairs, text): a div.lineleft yields <a>Name</a> value pairs, or plain prose
+    (e.g. an Effect blurb) when it holds no anchors."""
+    anchors = div.find_all("a")
+    if not anchors:
+        return None, div.get_text(" ", strip=True).replace("\xa0", " ").strip()
+    pairs = []
+    for a in anchors:
+        name = a.get_text(" ", strip=True)
+        val, sib = "", a.next_sibling
+        while sib and not (isinstance(sib, Tag) and sib.name in ("a", "br")):
+            if isinstance(sib, NavigableString):
+                val += str(sib)
+            sib = sib.next_sibling
+        pairs.append((name, val.replace("\xa0", " ").strip()))
+    return pairs, None
+
+
+def extract_stats(soup: BeautifulSoup) -> dict:
+    """Structured stat card → e.g.
+    {"scaling": {"str":"E","dex":"D"}, "requires": {"str":16,"dex":48},
+     "attack": {"phy":117}, "weak_to": ["Slash"], "weight": 7.0, "fp_cost": 7}."""
+    stats: dict = {}
+    for div in soup.select("table.wiki_table div.lineleft, table.infobox div.lineleft"):
+        key = _STAT_LABELS.get(_stat_label(div) or "")
+        if not key or key in stats:
+            continue
+        pairs, text = _lineleft_pairs(div)
+        if key in ("scaling", "requires", "attack", "guard"):
+            d: dict = {}
+            for name, val in (pairs or []):
+                nm = _STAT_ATTR.get(name.lower(), name.lower())
+                if key == "scaling":
+                    if val[:1].upper() in _STAT_GRADES:
+                        d[nm] = val[:1].upper()
+                else:
+                    m = re.search(r"-?\d+", val)
+                    if m:
+                        d[nm] = int(m.group())
+            if d:
+                stats[key] = d
+        elif key in ("weak_to", "strong_vs", "resistant", "immune"):
+            names = [n for n, _ in pairs] if pairs else ([text] if text else [])
+            if names:
+                stats[key] = names
+        elif key == "effect" and (text or pairs):
+            stats["effect"] = text or " ".join(n for n, _ in pairs)
+
+    # Plain stat cells the div.lineleft parser doesn't cover.
+    for td in soup.select("table.wiki_table td, table.infobox td"):
+        t = td.get_text(" ", strip=True).replace("\xa0", " ")
+        for pat, k, cast in (
+            (r"FP Cost\s*([\d.]+)", "fp_cost", int),
+            (r"Slots?\s*Used\s*(\d+)", "slots", int),
+            (r"Wgt\.?\s*([\d.]+)", "weight", float),
+            (r"Weight\s*([\d.]+)", "weight", float),
+        ):
+            m = re.match(pat, t)
+            if m and k not in stats:
+                try:
+                    stats[k] = cast(m.group(1))
+                except ValueError:
+                    pass
+    return stats
+
+
 # ── Dialogue ──────────────────────────────────────────────────────────────────
 
 _DIALOGUE_RE = re.compile(r"dialogue|speech|quotes|voice", re.I)
@@ -183,31 +290,59 @@ def extract_dialogue(soup: BeautifulSoup) -> list[str]:
 
     def _add(text: str) -> None:
         t = normalise(text)
-        if len(t) >= 20 and t not in seen:
+        if len(t) >= 15 and t not in seen:
             seen.add(t)
             lines.append(t)
 
-    # 1. Blockquotes inside tables — the most reliable NPC-speech signal
+    # A page counts as dialogue-bearing only if it has a Dialogue/Speech heading.
+    # We use that to gate the standalone-blockquote pass, so item flavour text
+    # (also a blockquote) isn't mis-captured as dialogue on non-NPC pages.
+    has_dialogue_section = any(
+        _DIALOGUE_RE.search(h.get_text()) for h in soup.find_all(["h2", "h3", "h4"])
+    )
+
+    # 1. Blockquotes inside tables — the most reliable NPC-speech signal.
     for table in soup.find_all("table"):
         for bq in table.find_all("blockquote"):
             _add(bq.get_text(separator=" ", strip=True))
 
-    # 2. Content under an explicit Dialogue / Speech / Quotes heading
+    # 1b. Standalone blockquotes (an NPC's signature line often sits outside any
+    #     table) — but only on pages that actually have a dialogue section.
+    if has_dialogue_section:
+        content = soup.select_one(
+            "div#wiki-content-block, div.wiki-content, article"
+        ) or soup
+        for bq in content.find_all("blockquote"):
+            if not bq.find_parent("table"):
+                _add(bq.get_text(separator=" ", strip=True))
+
+    # 2. Content under an explicit Dialogue / Speech / Quotes heading. Each
+    #    container's <em>/<i> lines are MERGED into one speech (Fextralife renders
+    #    a single spoken passage as many italic subtitle fragments — emitting one
+    #    entry per <em> shattered multi-line dialogue). We also scan <div>, not
+    #    just <p>/<ul>/<ol>, because some NPCs' lines sit in <div> wrappers.
     for heading in soup.find_all(["h2", "h3", "h4"]):
         if not _DIALOGUE_RE.search(heading.get_text()):
             continue
         sibling = heading.find_next_sibling()
         while sibling and isinstance(sibling, Tag):
+            if sibling.name in ("h2", "h3", "h4"):
+                break
             if sibling.name == "blockquote":
                 _add(sibling.get_text(separator=" ", strip=True))
-            elif sibling.name in ("p", "ul", "ol"):
-                for em in sibling.find_all(["em", "i"]):
-                    _add(em.get_text(separator=" ", strip=True))
-            elif sibling.name in ("h2", "h3", "h4"):
-                break
+            elif sibling.name in ("p", "div", "ul", "ol"):
+                ems = sibling.find_all(["em", "i"])
+                if ems:
+                    _add(" ".join(em.get_text(separator=" ", strip=True) for em in ems))
             sibling = sibling.find_next_sibling()
 
-    return lines
+    # Fextralife renders the same speech in both a table and a blockquote, so a
+    # line often appears twice — once partial, once full. Drop any entry that is a
+    # substring of another (keep the longer), preserving first-seen order.
+    return [
+        t for t in lines
+        if not any(t != other and t in other for other in lines)
+    ]
 
 
 # ── Item descriptions ─────────────────────────────────────────────────────────
@@ -228,6 +363,14 @@ def extract_item_descriptions(soup: BeautifulSoup) -> list[str]:
 
     for el in soup.select("div.codex, span.codex"):
         _add(el.get_text(separator=" ", strip=True))
+
+    # The in-game flavour text sits in a div.lineleft of italic <em> paragraphs —
+    # the same container class as the stat boxes, but prose with NO <a> stat
+    # anchors. That distinction is what makes it separable (the old codex/heading
+    # paths caught almost nothing, ~1% of item pages).
+    for div in soup.select("div.lineleft"):
+        if div.find(["em", "i"]) and not div.find("a"):
+            _add(div.get_text(separator=" ", strip=True))
 
     for heading in soup.find_all(["h2", "h3", "h4"]):
         if not _DESC_RE.search(heading.get_text()):
@@ -372,6 +515,7 @@ def parse_page(html: str, url: str, category: str) -> WikiPage:
         breadcrumb=breadcrumb,
         body_text=body_text,
         infobox=extract_infobox(soup),
+        stats=extract_stats(soup),
         dialogue=extract_dialogue(soup),
         item_descriptions=extract_item_descriptions(soup),
         image_url=extract_image_url(soup),

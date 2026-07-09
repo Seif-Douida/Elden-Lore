@@ -1,0 +1,26 @@
+# Keep the Docker build context small and secret-free.
+.git
+.venv
+**/__pycache__
+**/*.py[oc]
+
+# Local env / secrets (prod config comes from Cloud Run env vars).
+.env
+.env.*
+!.env.example
+env.yaml
+env.*.yaml
+
+# Large generated data artifacts — not needed in the serving image.
+data_pipeline/data
+qdrant_storage
+
+# Frontend deploys separately (Vercel).
+frontend
+
+# Dev-only: migrations, evals, docs, scratch outputs.
+alembic
+backend/eval
+*.md
+router_output.txt
+pipeline_output.txt

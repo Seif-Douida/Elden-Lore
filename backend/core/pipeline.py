@@ -19,6 +19,7 @@ the generation layer to build a prompt.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -26,6 +27,17 @@ from core.router import Router, ResolvedDecision
 from core.retriever import Retriever, RetrievedChunk
 
 DEFAULT_TOP_K = 8
+# Broad questions (enumerations, questlines, lore overviews) need more context than a
+# focused lookup. fetch_k=40 in the retriever, so returning more is free candidate-wise.
+BROAD_TOP_K = 14
+# summary (enumerations) and quest (multi-step guides) genuinely need breadth.
+# lore is usually a SINGLE entity — extra chunks just surface generic hub pages
+# (e.g. "Hornsent" → the generic "Lore" page outranked the Hornsent page at k=14).
+BROAD_INTENTS = {"summary", "quest"}
+
+
+def _k_for(intent: Optional[str], k: int) -> int:
+    return max(k, BROAD_TOP_K) if intent in BROAD_INTENTS else k
 
 
 @dataclass
@@ -36,6 +48,8 @@ class PipelineResult:
     retrieved:      bool                       # did we hit the retriever at all?
     entity_fallback: bool = False              # did the entity filter fall back?
     notes:          list[str] = field(default_factory=list)
+    timings:        dict = field(default_factory=dict)   # {router_ms, retrieval_ms}
+    roster:         list[str] = field(default_factory=list)  # enumeration titles (A)
 
 
 class Pipeline:
@@ -45,13 +59,20 @@ class Pipeline:
 
     def run(self, question: str, history: Optional[str] = None,
             k: int = DEFAULT_TOP_K) -> PipelineResult:
+        _t0 = time.perf_counter()
         decision = self._router.route(question, history)
+        router_ms = int((time.perf_counter() - _t0) * 1000)
+        timings = {"router_ms": router_ms, "retrieval_ms": 0}
         notes: list[str] = []
 
         # Greetings / chitchat — no retrieval.
         if not decision.needs_retrieval:
             notes.append("needs_retrieval=False → skipped retrieval")
-            return PipelineResult(question, decision, [], retrieved=False, notes=notes)
+            return PipelineResult(question, decision, [], retrieved=False,
+                                  notes=notes, timings=timings)
+
+        # Broad intents (summary/quest/lore) get more chunks for completeness.
+        k = _k_for(decision.intent, k)
 
         has_intent = decision.intent is not None
         boost_kwargs = dict(
@@ -62,10 +83,30 @@ class Pipeline:
             diversity_penalty=True,            # always helpful, intent or not
         )
 
+        # category_hint is a HARD Qdrant filter, and the router's category guess is
+        # unreliable — e.g. "Who is Vyke?" → category_hint=lore, but the Vyke NPC page
+        # is category 'quest', so an entity+category AND-filter excluded the very page
+        # we wanted. When an entity is resolved it's already the precision signal, so
+        # DON'T also hard-filter by category (which can only over-constrain). Also drop
+        # it for BROAD intents: "which bosses are mandatory" gets category_hint='boss',
+        # but the answer lives in the Bosses HUB page's "Mandatory Bosses" section (a
+        # different category), so category=boss would exclude the very chunk we need.
+        # Keep the category filter only for entity-less, narrow-intent queries.
+        use_category = not decision.entity_focus and decision.intent not in BROAD_INTENTS
+
+        # chunk_type_bias is ALSO a HARD filter, and Gemma sometimes mis-sets it — e.g.
+        # "Why was Godwyn killed?" got chunk_type_bias='item_desc'. That AND-filtered the
+        # Godwyn entity down to ~nothing, the fallback dropped the entity but KEPT
+        # chunk_type='item_desc', so retrieval scanned every item description and returned
+        # junk ("Skills · Item Description") → the model refused garbage context. Only
+        # 'dialogue' is a reliable hard constraint (dialogue chunks are sparse and
+        # distinctly wanted for "what does X say"); for body/item_desc the intent boost
+        # already handles preference, so don't let a stray bias become a hard filter.
+        chunk_type_filter = decision.chunk_type_bias if decision.chunk_type_bias == "dialogue" else None
         common = dict(
             k=k,
-            category=decision.category_hint,
-            chunk_type=decision.chunk_type_bias,
+            category=decision.category_hint if use_category else None,
+            chunk_type=chunk_type_filter,
             **boost_kwargs,
         )
 
@@ -74,23 +115,43 @@ class Pipeline:
         # Falls back to the raw question when retrieval_query is None.
         embed_query = decision.retrieval_query or question
 
+        # For enumeration, the roster is authoritative — don't let a mis-resolved
+        # CATEGORY entity (e.g. "katanas" → "Katar") narrow the descriptive
+        # retrieval; search broadly so the supporting context is on-topic.
+        entities = [] if decision.enumerate_group else decision.entity_focus
+
         # ── Attempt 1: hard entity filter (if any entity resolved) ───────────
         entity_fallback = False
         chunks: list[RetrievedChunk] = []
-        if decision.entity_focus:
+        _tr = time.perf_counter()
+        if entities:
             chunks = self._retriever.retrieve(
-                embed_query, entities=decision.entity_focus, **common
+                embed_query, entities=entities, **common
             )
             if not chunks:
                 # ── Fallback: drop the entity filter, keep intent/boosts ─────
                 entity_fallback = True
                 notes.append(
-                    f"entity filter {decision.entity_focus} returned empty → "
+                    f"entity filter {entities} returned empty → "
                     "fell back to no-entity search (check entity casing/coverage)"
                 )
                 chunks = self._retriever.retrieve(embed_query, **common)
         else:
             chunks = self._retriever.retrieve(embed_query, **common)
+        timings["retrieval_ms"] = int((time.perf_counter() - _tr) * 1000)
+
+        # Enumeration: for "how many / list all X", get the precise roster from
+        # metadata (the vector chunks above still provide descriptions). Empty →
+        # ignore and fall back to the normal answer.
+        roster: list[str] = []
+        if decision.enumerate_group:
+            roster = self._retriever.enumerate_titles(
+                decision.enumerate_group, category=decision.category_hint
+            )
+            if not roster:  # category_hint may be wrong/too strict — retry without it
+                roster = self._retriever.enumerate_titles(decision.enumerate_group)
+            if roster:
+                notes.append(f"enumerate '{decision.enumerate_group}' → {len(roster)} titles")
 
         return PipelineResult(
             question=question,
@@ -99,6 +160,8 @@ class Pipeline:
             retrieved=True,
             entity_fallback=entity_fallback,
             notes=notes,
+            timings=timings,
+            roster=roster,
         )
 
 

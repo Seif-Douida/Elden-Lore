@@ -17,16 +17,18 @@ metadata (no per-token DB writes).
 from __future__ import annotations
 
 import json
+import time
 import uuid
-from typing import Iterator, Optional
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool, iterate_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.pipeline import Pipeline
-from core.generate import Generator
+from core.generate import Generator, answer_stats
 from api.deps import get_pipeline, get_generator
 from api.db.session import get_session
 from api.db import repository as repo
@@ -164,7 +166,12 @@ async def conversation_chat(
         )
 
     async def event_gen():
-        result = pipeline.run(body.question, history=history, k=body.k)
+        t0 = time.perf_counter()
+        # Offload the blocking router+retrieval off the event loop so concurrent
+        # users don't serialize behind each other.
+        result = await run_in_threadpool(
+            pipeline.run, body.question, history=history, k=body.k
+        )
         # tone: explicit override → else router's pick
         if body.tone:
             result.decision.tone = body.tone
@@ -175,22 +182,43 @@ async def conversation_chat(
             "entity_fallback": result.entity_fallback,
         })
 
+        trace: dict = {}
         parts: list[str] = []
+        gen_start = time.perf_counter()
+        ttft_ms: Optional[int] = None
         try:
-            for token in generator.stream(result, history=history):
+            # Iterate the sync token generator IN THE THREADPOOL so the loop stays
+            # free between tokens (interleaves other users' streams).
+            async for token in iterate_in_threadpool(
+                generator.stream(result, history=history, trace=trace)
+            ):
+                if ttft_ms is None:
+                    ttft_ms = int((time.perf_counter() - gen_start) * 1000)
                 parts.append(token)
                 yield _sse("token", {"text": token})
-            sources, images = Generator.assemble_metadata(result)
+
+            answer = "".join(parts)
+            sources, images = Generator.assemble_metadata(result, answer_text=answer)
             yield _sse("sources", {"sources": sources})
             yield _sse("images", {"images": images})
             # 4) persist the assistant message with full text + metadata
             await repo.add_message(
-                db, conv_id, role="assistant", content="".join(parts),
+                db, conv_id, role="assistant", content=answer,
                 sources=sources, images=images, tone=result.decision.tone,
             )
-            yield _sse("done", {})
+            stats = answer_stats(result, trace.get("model"), {
+                "ttft_ms": ttft_ms,
+                "gen_ms": int((time.perf_counter() - gen_start) * 1000),
+                "total_ms": int((time.perf_counter() - t0) * 1000),
+            })
+            log.info("chat.done", extra={"fields": {
+                **stats, "conv_id": str(conv_id), "user_id": str(user_id),
+                "question": body.question[:200],
+            }})
+            yield _sse("done", {"stats": stats})
         except Exception:
-            log.exception("generation failed mid-stream")
+            log.exception("generation failed mid-stream",
+                          extra={"fields": {"conv_id": str(conv_id)}})
             # still persist whatever was produced, marked partial
             if parts:
                 await repo.add_message(

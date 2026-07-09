@@ -1,27 +1,245 @@
 [
-  {"id": "user_mohgwyn",        "question": "I am in the mountain top of the giants, How can I reach Mohgwyn Palace?",                                                          "category": "location",  "expected_entity": "Mohgwyn Palace",           "expected_intent": "location"},
-  {"id": "user_somber_stones",  "question": "I would like you tell me how many somber ancient dragon smithing stones are there in the DLC and provide me their location.",       "category": "summary",   "expected_entity": "",                         "expected_intent": "summary"},
-  {"id": "user_dlc_bosses_1",   "question": "How many main dlc bosses are there ?",                                                                                              "category": "summary",   "expected_entity": "",                         "expected_intent": "summary"},
-  {"id": "user_dlc_first",      "question": "Where should I go first in the DLC?",                                                                                               "category": "summary",   "expected_entity": "",                         "expected_intent": "summary"},
-  {"id": "user_dlc_access",     "question": "How do I access the DLC starting point from the base game?",                                                                        "category": "location",  "expected_entity": "",                         "expected_intent": "location"},
-  {"id": "user_milady",         "question": "Hello. I am looking for the milady sword in the dlc. where can I find it?",                                                         "category": "location",  "expected_entity": "Milady",                   "expected_intent": "location"},
-  {"id": "user_castle_ensis",   "question": "How do I access Castle Ensis?",                                                                                                     "category": "location",  "expected_entity": "Castle Ensis",             "expected_intent": "location"},
-  {"id": "user_frenzied_ending","question": "I would like to get the frenzied flame ending",                                                                                     "category": "quest",     "expected_entity": "",                         "expected_intent": "quest"},
-  {"id": "user_dragons_lore",   "question": "I am fascinated about the dragons in elden ring. Can you tell more about them?",                                                    "category": "lore",      "expected_entity": "",                         "expected_intent": "lore"},
-  {"id": "user_placidusax",     "question": "Who is the nemesis of placidusax?",                                                                                                 "category": "lore",      "expected_entity": "Dragonlord Placidusax",    "expected_intent": "lore"},
-  {"id": "user_messmer_lore",   "question": "Tell me the story of Messmer the Impaler.",                                                                                         "category": "lore",      "expected_entity": "Messmer the Impaler",      "expected_intent": "lore"},
-  {"id": "user_greatsword",     "question": "Where can I find the Greatsword?",                                                                                                  "category": "ambiguous", "expected_entity": "Greatsword",               "expected_intent": "location"},
-  {"id": "user_bloodhound_fang","question": "Give me the stats of the Bloodhound fang",                                                                                          "category": "item_desc", "expected_entity": "Bloodhound's Fang",        "expected_intent": ""},
-  {"id": "user_abyssal_woods",  "question": "How do I reach the abyssal woods?",                                                                                                 "category": "location",  "expected_entity": "Abyssal Woods",            "expected_intent": "location"},
-  {"id": "user_dlc_bosses_2",   "question": "How many main bosses in the dlc are there?",                                                                                        "category": "summary",   "expected_entity": "",                         "expected_intent": "summary"},
-  {"id": "user_duskborn_ending","question": "How do I achieve the Age of the Duskborn Ending?",                                                                                  "category": "quest",     "expected_entity": "",                         "expected_intent": "quest"},
-  {"id": "user_fia_quest",      "question": "guide me through Fia's questline",                                                                                                  "category": "quest",     "expected_entity": "Fia",                      "expected_intent": "quest"},
-  {"id": "user_vyke_lore",      "question": "Who is Vyke?",                                                                                                                      "category": "lore",      "expected_entity": "Vyke",                     "expected_intent": "lore"},
-  {"id": "user_mandatory_bosses","question": "Give me all the mandatory bosses to beat elden ring",                                                                              "category": "summary",   "expected_entity": "",                         "expected_intent": "summary"},
-  {"id": "user_midra_lore",     "question": "Explain to me who was Midra?",                                                                                                      "category": "lore",      "expected_entity": "Midra",                    "expected_intent": "lore"},
-  {"id": "user_dex_build",      "question": "Help me build a dex build?",                                                                                                        "category": "strategy",  "expected_entity": "",                         "expected_intent": "strategy"},
-  {"id": "user_radagon_soreseal","question": "Where can I find the Radagon's Soreseal Talisman?",                                                                               "category": "location",  "expected_entity": "Radagon's Soreseal",       "expected_intent": "location"},
-  {"id": "user_malenia_rune",   "question": "How to activate Malenia's Great Rune",                                                                                              "category": "quest",     "expected_entity": "Malenia's Great Rune",     "expected_intent": "quest"},
-  {"id": "user_hornsent_lore",  "question": "Hello I want to know about the Hornsent.",                                                                                          "category": "lore",      "expected_entity": "Hornsent",                 "expected_intent": "lore"},
-  {"id": "user_stormveil_items","question": "I need the list of all important items in stormveil castle.",                                                                       "category": "summary",   "expected_entity": "Stormveil Castle",         "expected_intent": "summary"}
+  {
+    "id": "user_mohgwyn",
+    "question": "I am in the mountain top of the giants, How can I reach Mohgwyn Palace?",
+    "category": "location",
+    "expected_entity": "Mohgwyn Palace",
+    "expected_intent": "location"
+  },
+  {
+    "id": "user_somber_stones",
+    "question": "I would like you tell me how many somber ancient dragon smithing stones are there in the DLC and provide me their location.",
+    "category": "summary",
+    "expected_entity": "",
+    "expected_intent": "summary"
+  },
+  {
+    "id": "user_dlc_bosses_1",
+    "question": "How many main dlc bosses are there ?",
+    "category": "summary",
+    "expected_entity": "",
+    "expected_intent": "summary"
+  },
+  {
+    "id": "user_dlc_first",
+    "question": "Where should I go first in the DLC?",
+    "category": "summary",
+    "expected_entity": "",
+    "expected_intent": "summary"
+  },
+  {
+    "id": "user_dlc_access",
+    "question": "How do I access the DLC starting point from the base game?",
+    "category": "location",
+    "expected_entity": "",
+    "expected_intent": "location"
+  },
+  {
+    "id": "user_milady",
+    "question": "Hello. I am looking for the milady sword in the dlc. where can I find it?",
+    "category": "location",
+    "expected_entity": "Milady",
+    "expected_intent": "location"
+  },
+  {
+    "id": "user_castle_ensis",
+    "question": "How do I access Castle Ensis?",
+    "category": "location",
+    "expected_entity": "Castle Ensis",
+    "expected_intent": "location"
+  },
+  {
+    "id": "user_frenzied_ending",
+    "question": "I would like to get the frenzied flame ending",
+    "category": "quest",
+    "expected_entity": "",
+    "expected_intent": "quest"
+  },
+  {
+    "id": "user_dragons_lore",
+    "question": "I am fascinated about the dragons in elden ring. Can you tell more about them?",
+    "category": "lore",
+    "expected_entity": "",
+    "expected_intent": "lore"
+  },
+  {
+    "id": "user_placidusax",
+    "question": "Who is the nemesis of placidusax?",
+    "category": "lore",
+    "expected_entity": "Dragonlord Placidusax",
+    "expected_intent": "lore"
+  },
+  {
+    "id": "user_messmer_lore",
+    "question": "Tell me the story of Messmer the Impaler.",
+    "category": "lore",
+    "expected_entity": "Messmer the Impaler",
+    "expected_intent": "lore"
+  },
+  {
+    "id": "user_greatsword",
+    "question": "Where can I find the Greatsword?",
+    "category": "ambiguous",
+    "expected_entity": "Greatsword",
+    "expected_intent": "location"
+  },
+  {
+    "id": "user_bloodhound_fang",
+    "question": "Give me the stats of the Bloodhound fang",
+    "category": "item_desc",
+    "expected_entity": "Bloodhound's Fang",
+    "expected_intent": ""
+  },
+  {
+    "id": "user_abyssal_woods",
+    "question": "How do I reach the abyssal woods?",
+    "category": "location",
+    "expected_entity": "Abyssal Woods",
+    "expected_intent": "location"
+  },
+  {
+    "id": "user_dlc_bosses_2",
+    "question": "How many main bosses in the dlc are there?",
+    "category": "summary",
+    "expected_entity": "",
+    "expected_intent": "summary"
+  },
+  {
+    "id": "user_duskborn_ending",
+    "question": "How do I achieve the Age of the Duskborn Ending?",
+    "category": "quest",
+    "expected_entity": "",
+    "expected_intent": "quest"
+  },
+  {
+    "id": "user_fia_quest",
+    "question": "guide me through Fia's questline",
+    "category": "quest",
+    "expected_entity": "Fia",
+    "expected_intent": "quest"
+  },
+  {
+    "id": "user_vyke_lore",
+    "question": "Who is Vyke?",
+    "category": "lore",
+    "expected_entity": "Vyke",
+    "expected_intent": "lore"
+  },
+  {
+    "id": "user_mandatory_bosses",
+    "question": "Give me all the mandatory bosses to beat elden ring",
+    "category": "summary",
+    "expected_entity": "",
+    "expected_intent": "summary"
+  },
+  {
+    "id": "user_midra_lore",
+    "question": "Explain to me who was Midra?",
+    "category": "lore",
+    "expected_entity": "Midra",
+    "expected_intent": "lore"
+  },
+  {
+    "id": "user_dex_build",
+    "question": "Help me build a dex build?",
+    "category": "strategy",
+    "expected_entity": "",
+    "expected_intent": "strategy"
+  },
+  {
+    "id": "user_radagon_soreseal",
+    "question": "Where can I find the Radagon's Soreseal Talisman?",
+    "category": "location",
+    "expected_entity": "Radagon's Soreseal",
+    "expected_intent": "location"
+  },
+  {
+    "id": "user_malenia_rune",
+    "question": "How to activate Malenia's Great Rune",
+    "category": "quest",
+    "expected_entity": "Malenia's Great Rune",
+    "expected_intent": "quest"
+  },
+  {
+    "id": "user_hornsent_lore",
+    "question": "Hello I want to know about the Hornsent.",
+    "category": "lore",
+    "expected_entity": "Hornsent",
+    "expected_intent": "lore"
+  },
+  {
+    "id": "user_stormveil_items",
+    "question": "I need the list of all important items in stormveil castle.",
+    "category": "summary",
+    "expected_entity": "Stormveil Castle",
+    "expected_intent": "summary"
+  },
+  {
+    "id": "user_count_katanas",
+    "question": "How many katanas are there in elden ring?",
+    "category": "summary",
+    "expected_intent": "summary",
+    "expected_enumerate_group": "Katanas"
+  },
+  {
+    "id": "user_list_katanas",
+    "question": "List me all the katanas",
+    "category": "summary",
+    "expected_intent": "summary",
+    "expected_enumerate_group": "Katanas"
+  },
+  {
+    "id": "user_count_talismans",
+    "question": "How many talismans are there in elden ring?",
+    "category": "summary",
+    "expected_intent": "summary",
+    "expected_enumerate_group": "Talismans"
+  },
+  {
+    "id": "user_count_curved_swords",
+    "question": "How many curved swords are there?",
+    "category": "summary",
+    "expected_intent": "summary",
+    "expected_enumerate_group": "Curved Swords"
+  },
+  {
+    "id": "user_count_greatswords",
+    "question": "How many greatswords are there?",
+    "category": "summary",
+    "expected_intent": "summary",
+    "expected_enumerate_group": "Greatswords"
+  },
+  {
+    "id": "user_age_of_stars",
+    "question": "How to get the age of stars ending?",
+    "category": "quest",
+    "expected_entity": "Ranni",
+    "expected_intent": "quest"
+  },
+  {
+    "id": "user_dms_build",
+    "question": "Can you give me a build using Dark Moon Greatsword?",
+    "category": "strategy",
+    "expected_entity": "Dark Moon Greatsword",
+    "expected_intent": "strategy"
+  },
+  {
+    "id": "user_bloodhound_category",
+    "question": "What weapon category is the bloodhound fang?",
+    "category": "item_desc",
+    "expected_entity": "Bloodhound's Fang"
+  },
+  {
+    "id": "user_count_somber_dragon",
+    "question": "How many somber ancient dragon smithing stones are available in the DLC?",
+    "category": "summary",
+    "expected_entity": "Somber Ancient Dragon Smithing Stone",
+    "expected_intent": "summary"
+  },
+  {
+    "id": "user_mandatory_bosses_base",
+    "question": "What bosses are mandatory to finish the base game?",
+    "category": "summary",
+    "expected_intent": "summary"
+  }
 ]

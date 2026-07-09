@@ -30,7 +30,7 @@ log = get_logger("api.main")
 async def lifespan(app: FastAPI):
     # ── Startup: build heavy singletons once ─────────────────────────────────
     settings = get_settings()
-    configure_logging("INFO")
+    configure_logging(settings.log_level)
     log.info("starting API (env=%s) — building pipeline & generator…", settings.environment)
 
     # Imported here so app import stays cheap and testable.

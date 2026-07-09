@@ -18,6 +18,7 @@ event.
 from __future__ import annotations
 
 import json
+import time
 from typing import Iterator, Optional
 
 from fastapi import APIRouter, Depends
@@ -25,7 +26,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from core.pipeline import Pipeline
-from core.generate import Generator
+from core.generate import Generator, answer_stats
 from api.deps import get_pipeline, get_generator
 from api.logging_config import get_logger
 
@@ -46,6 +47,9 @@ def _sse(event: str, data: dict) -> str:
 
 def _event_stream(pipeline: Pipeline, generator: Generator,
                   question: str, history: Optional[str], k: int) -> Iterator[str]:
+    # This endpoint is sync `def`, so Starlette iterates it in the threadpool —
+    # each stream already runs off the event loop (no manual offload needed here).
+    t0 = time.perf_counter()
     try:
         result = pipeline.run(question, history=history, k=k)
         yield _sse("meta", {
@@ -53,13 +57,27 @@ def _event_stream(pipeline: Pipeline, generator: Generator,
             "used_retrieval": result.retrieved,
             "entity_fallback": result.entity_fallback,
         })
-        for token in generator.stream(result, history=history):
+        trace: dict = {}
+        parts: list[str] = []
+        gen_start = time.perf_counter()
+        ttft_ms: Optional[int] = None
+        for token in generator.stream(result, history=history, trace=trace):
+            if ttft_ms is None:
+                ttft_ms = int((time.perf_counter() - gen_start) * 1000)
+            parts.append(token)
             yield _sse("token", {"text": token})
-        sources, images = Generator.assemble_metadata(result)
+        answer = "".join(parts)
+        sources, images = Generator.assemble_metadata(result, answer_text=answer)
         yield _sse("sources", {"sources": sources})
         yield _sse("images", {"images": images})
-        yield _sse("done", {})
-    except Exception as e:  # noqa: BLE001
+        stats = answer_stats(result, trace.get("model"), {
+            "ttft_ms": ttft_ms,
+            "gen_ms": int((time.perf_counter() - gen_start) * 1000),
+            "total_ms": int((time.perf_counter() - t0) * 1000),
+        })
+        log.info("chat.done", extra={"fields": {**stats, "question": question[:200]}})
+        yield _sse("done", {"stats": stats})
+    except Exception:
         log.exception("error while streaming answer")
         yield _sse("error", {"message": "Generation failed. Please try again."})
 

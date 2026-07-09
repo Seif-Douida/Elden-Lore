@@ -154,6 +154,7 @@ class WikiPage:
     item_descriptions: list[str]
     image_url:         Optional[str]
     internal_links:    list[str]
+    stats:             dict = field(default_factory=dict)   # structured stat card
     scraped_at:        float = field(default_factory=time.time)
 
     def to_dict(self) -> dict:

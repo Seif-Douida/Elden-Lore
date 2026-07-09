@@ -31,6 +31,7 @@ class Settings(BaseSettings):
 
     # ── Environment ──────────────────────────────────────────────────────────
     environment: Literal["dev", "prod"] = Field(default="dev", alias="ENVIRONMENT")
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     # ── API server ───────────────────────────────────────────────────────────
     api_host: str = Field(default="0.0.0.0", alias="API_HOST")

@@ -3,19 +3,24 @@ backend/core/llm.py
 
 The LLM layer: one interface, three providers, transparent fallback.
 
-    NIM  ──fail──▶  Gemini 2.5 Flash  ──fail──▶  Ollama (local)
-  primary             cloud fallback               last resort
+    CHAT (generation):  order set by GEN_TIER_ORDER, default:
+        Gemini Flash  ──fail──▶  NIM  ──fail──▶  Ollama (local)
+      primary                    fallback           last resort
+    ROUTER (structured):  NIM (llama-3.1-8b)  ──fail──▶  Gemini  ──fail──▶  Ollama
 
 All three are LangChain BaseChatModels, so .invoke(), .stream(), and
 .with_structured_output() behave identically regardless of which tier answers.
 Downstream code (router, chat chain, summariser) calls one object and never
 needs to know who responded.
 
+The chat tier order is env-driven (GEN_TIER_ORDER) so the primary AND fallback are
+config, not code — flip it to A/B models without a code change. The router keeps a
+fixed NIM-first order (the 8B is fast and reliably does structured output).
+
 Resilience is graceful: a tier is only added to the chain if its credentials
-are present. With just NVIDIA_API_KEY set, you get NIM alone. Add GOOGLE_API_KEY
-and/or run Ollama, and they slot into the fallback chain automatically — no code
-change. Fallback triggers ONLY on retryable errors (rate limit, server error,
-timeout, connection) — never on a 400/auth error that would fail everywhere.
+are present. Unconfigured tiers in the order are silently skipped. Fallback
+triggers ONLY on retryable errors (rate limit, server error, timeout, connection)
+— never on a 400/auth error that would fail everywhere.
 
 Two separate NIM models are used:
   NIM_MODEL        — answer generation (chat). Can be any quality model.
@@ -27,12 +32,13 @@ Two separate NIM models are used:
                      nemotron-3-ultra-550b-a55b) — those calls hang indefinitely.
 
 Env (.env):
-    NVIDIA_API_KEY     required for the NIM primary
-    GOOGLE_API_KEY     enables the Gemini fallback (optional)
+    GOOGLE_API_KEY     enables Gemini (the default chat primary)
+    NVIDIA_API_KEY     enables NIM (chat fallback + router primary)
     OLLAMA_HOST        enables the Ollama last resort (optional, default localhost)
-    NIM_MODEL          default: nvidia/nemotron-3-ultra-550b-a55b  (chat)
+    GEN_TIER_ORDER     chat tier order, default: gemini,nim,ollama
+    GEMINI_MODEL       default: gemini-2.5-flash   (chat primary; try gemini-3-flash)
+    NIM_MODEL          default: nvidia/nemotron-3-ultra-550b-a55b  (chat fallback)
     NIM_ROUTER_MODEL   default: meta/llama-3.1-8b-instruct            (routing)
-    GEMINI_MODEL       default: gemini-2.5-flash
     OLLAMA_MODEL       default: llama3.2:3b
 """
 
@@ -59,6 +65,46 @@ OLLAMA_MODEL     = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 # Whether to attempt the local Ollama tier at all. Off unless explicitly enabled,
 # so a machine without Ollama doesn't pay a connection timeout on every fallback.
 USE_OLLAMA = os.getenv("USE_OLLAMA", "false").lower() in ("1", "true", "yes")
+
+# Tier orders are lists of "provider:model" specs (primary first), env-driven so
+# the primary AND fallbacks are config, not code. A bare "provider" uses that
+# provider's default model. Providers: gemini (Google, incl. Gemma), nim (NVIDIA),
+# ollama (local). Unconfigured tiers (missing creds) are skipped at assembly.
+#   e.g. GEN_TIER_ORDER=gemini:gemma-4-31b-it,gemini:gemma-4-26b-a4b-it,nim
+#
+# Default = Gemma 4 (1500 RPD on the free tier vs 20 RPD for Gemini Flash), which
+# also drives the router via JSON-mode structured output. NIM nemotron is a
+# cross-provider chat fallback.
+# Both chat and router use gemma-4-26b-a4b-it PRIMARY: it's the MoE (active-4B)
+# variant — ~1s ttft vs ~7s for the 31B dense model (measured), with comparable
+# answer quality for context-grounded RAG. With thinking disabled (see _build_gemini)
+# it's fast and direct. 31B is a slower fallback; NIM is the cross-provider safety net.
+_DEFAULT_GEN_ORDER = ["gemini:gemma-4-26b-a4b-it", "gemini:gemma-4-31b-it", "nim"]
+# Router needs structured output (Gemma via JSON mode, NIM-8B via function-calling —
+# handled per-tier in get_structured_llm).
+_DEFAULT_ROUTER_ORDER = ["gemini:gemma-4-26b-a4b-it", "gemini:gemma-4-31b-it",
+                         "nim:meta/llama-3.1-8b-instruct"]
+
+
+def _parse_order(raw: str | None, default: list[str]) -> list[str]:
+    if not raw:
+        return list(default)
+    specs = [x.strip() for x in raw.split(",") if x.strip()]
+    return specs or list(default)
+
+
+def _parse_spec(spec: str) -> tuple[str, str | None]:
+    """'gemini:gemma-4-31b-it' → ('gemini', 'gemma-4-31b-it'); 'nim' → ('nim', None).
+    Split on the FIRST colon only, so ollama:llama3.2:3b keeps its model tag."""
+    spec = spec.strip()
+    if ":" in spec:
+        provider, model = spec.split(":", 1)
+        return provider.strip().lower(), model.strip()
+    return spec.lower(), None
+
+
+GEN_TIER_ORDER    = _parse_order(os.getenv("GEN_TIER_ORDER"), _DEFAULT_GEN_ORDER)
+ROUTER_TIER_ORDER = _parse_order(os.getenv("ROUTER_TIER_ORDER"), _DEFAULT_ROUTER_ORDER)
 
 
 # ── Retryable exceptions ──────────────────────────────────────────────────────
@@ -89,12 +135,22 @@ def _retryable_exceptions() -> tuple[type[BaseException], ...]:
         excs += [RateLimitError, APITimeoutError, APIConnectionError, InternalServerError]
     except Exception:
         pass
-    # Google API errors
+    # Google API errors (legacy google.api_core path — embeddings/older clients)
     try:
         from google.api_core.exceptions import (
             ResourceExhausted, ServiceUnavailable, DeadlineExceeded, InternalServerError as GISE,
         )
         excs += [ResourceExhausted, ServiceUnavailable, DeadlineExceeded, GISE]
+    except Exception:
+        pass
+    # New google-genai SDK (used by current langchain-google-genai). Its errors do
+    # NOT subclass google.api_core, so a Gemini 429/5xx would otherwise never fall
+    # back. APIError is the base of ClientError (incl. 429) + ServerError; treating
+    # it as retryable means any Gemini outage/quota gracefully drops to the next
+    # tier instead of a hard "Generation failed".
+    try:
+        from google.genai.errors import APIError as GenAIAPIError
+        excs += [GenAIAPIError]
     except Exception:
         pass
     return tuple(excs)
@@ -114,81 +170,149 @@ def _build_nim(temperature: float, model: str | None = None):
     )
 
 
-def _build_gemini(temperature: float):
+def _gemini_safety():
+    """Turn OFF content blocking. This is an Elden Ring wiki — its lore is full of
+    'impaler / blood / rot / kill', and the default filter false-blocks benign
+    queries (a plain 'where is Moonveil?' tripped PROHIBITED_CONTENT). Only the 4
+    categories this endpoint accepts."""
+    from langchain_google_genai import HarmBlockThreshold, HarmCategory
+    return {
+        HarmCategory.HARM_CATEGORY_HARASSMENT:        HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_HATE_SPEECH:       HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+    }
+
+
+def _build_gemini(temperature: float, model: str | None = None):
     if not GOOGLE_API_KEY:
         return None
     from langchain_google_genai import ChatGoogleGenerativeAI
     return ChatGoogleGenerativeAI(
-        model=GEMINI_MODEL,
+        model=model or GEMINI_MODEL,
         google_api_key=GOOGLE_API_KEY,
         temperature=temperature,
+        safety_settings=_gemini_safety(),
+        # Gemma 4 is a REASONING model — by default it streams a long hidden
+        # 'thinking' block before the answer (10-30s of invisible latency, which
+        # looked like hangs). thinking_level='minimal' produces zero thought
+        # tokens (thinking_budget=0 is unsupported; includeThoughts=false is a
+        # silent no-op on Gemma 4). We answer from retrieved context, so no
+        # chain-of-thought is needed.
+        thinking_level="minimal",
     )
 
 
-def _build_ollama(temperature: float):
+def _build_ollama(temperature: float, model: str | None = None):
     if not USE_OLLAMA:
         return None
     from langchain_ollama import ChatOllama
     return ChatOllama(
-        model=OLLAMA_MODEL,
+        model=model or OLLAMA_MODEL,
         base_url=OLLAMA_HOST,
         temperature=temperature,
     )
 
 
-def _assemble_chain(temperature: float, nim_model: str | None = None):
-    """
-    Build the NIM→Gemini→Ollama chain from whichever tiers are configured.
-    The first available tier is the primary; the rest become ordered fallbacks.
-    Pass nim_model to override the NIM model (e.g. NIM_ROUTER_MODEL for routing).
-    """
-    tiers = [t for t in (
-        _build_nim(temperature, model=nim_model),
-        _build_gemini(temperature),
-        _build_ollama(temperature),
-    ) if t is not None]
+def _build_tier(provider: str, temperature: float, model: str | None = None):
+    """Build one tier from a (provider, model) spec, or None if creds/flags absent."""
+    if provider == "nim":
+        return _build_nim(temperature, model=model)
+    if provider == "gemini":
+        return _build_gemini(temperature, model=model)
+    if provider == "ollama":
+        return _build_ollama(temperature, model=model)
+    return None
 
-    if not tiers:
+
+def _structured_method(provider: str) -> str | None:
+    """How to coerce structured output per provider. Gemma/Gemini support JSON mode
+    (response_schema) but NOT function-calling; NIM does function-calling (langchain's
+    default → None). Using the wrong one hard-fails (Gemma → 'Invalid json output')."""
+    return "json_mode" if provider == "gemini" else None
+
+
+def _build_from_order(order: list[str], temperature: float):
+    """Build (provider, model) pairs + their live models for an order, skipping
+    unconfigured tiers. Returns list of (provider, model, llm)."""
+    out = []
+    for spec in order:
+        provider, model = _parse_spec(spec)
+        llm = _build_tier(provider, temperature, model=model)
+        if llm is not None:
+            out.append((provider, model, llm))
+    return out
+
+
+def _chain(runnables: list):
+    """First runnable is primary; the rest are ordered fallbacks (retryable only)."""
+    if not runnables:
         raise RuntimeError(
-            "No LLM provider configured. Set NVIDIA_API_KEY (and optionally "
-            "GOOGLE_API_KEY / USE_OLLAMA) in your .env."
+            "No LLM provider configured. Set GOOGLE_API_KEY and/or NVIDIA_API_KEY "
+            "(or USE_OLLAMA) in your .env, and a valid tier order."
         )
-
-    primary, fallbacks = tiers[0], tiers[1:]
+    primary, fallbacks = runnables[0], runnables[1:]
     if not fallbacks:
         return primary
-    return primary.with_fallbacks(
-        fallbacks,
-        exceptions_to_handle=_retryable_exceptions(),
-    )
+    return primary.with_fallbacks(tuple(fallbacks), exceptions_to_handle=_retryable_exceptions())
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def get_chat_llm(temperature: float = 0.7):
-    """General chat / streaming model (used by the chat endpoint, summariser)."""
-    return _assemble_chain(temperature)
+    """General chat / streaming model (chat endpoint, summariser). Plain (no
+    structured output). Tier order from GEN_TIER_ORDER."""
+    tiers = _build_from_order(GEN_TIER_ORDER, temperature)
+    return _chain([llm for _p, _m, llm in tiers])
 
 
-def get_router_llm(temperature: float = 0.0):
+def get_structured_llm(schema, temperature: float = 0.0, order: list[str] | None = None):
     """
-    Deterministic model for the agent router's structured output.
-    Uses NIM_ROUTER_MODEL (default: meta/llama-3.1-8b-instruct), which is fast
-    and reliably handles with_structured_output(). temperature=0 for stable JSON.
+    Structured-output chain for the router (Call 1 / Call 2). Wraps EACH tier with
+    the right method for its provider — JSON mode for Gemini/Gemma, function-calling
+    (langchain default) for NIM — THEN chains them as fallbacks. This is why a
+    mixed Gemma→NIM router works: each tier is coerced the way it supports.
     """
-    return _assemble_chain(temperature, nim_model=NIM_ROUTER_MODEL)
+    tiers = _build_from_order(order or ROUTER_TIER_ORDER, temperature)
+    wrapped = []
+    for provider, model, llm in tiers:
+        method = _structured_method(provider)
+        # NIM's with_structured_output eagerly fetches /v1/models to validate the
+        # model — a NETWORK call at build time. If NVIDIA is unreachable (offline,
+        # DNS, outage) that must NOT crash startup: skip the tier, keep the others.
+        try:
+            wrapped.append(
+                llm.with_structured_output(schema, method=method) if method
+                else llm.with_structured_output(schema)
+            )
+        except Exception as e:  # noqa: BLE001
+            import logging
+            logging.getLogger("core.llm").warning(
+                "structured tier %s:%s unavailable at build (%s) — skipping",
+                provider, model, type(e).__name__,
+            )
+    return _chain(wrapped)
+
+
+def _labels_for(order: list[str]) -> list[str]:
+    """Configured tiers in an order as 'provider:model' labels (skips missing creds)."""
+    out = []
+    for spec in order:
+        provider, model = _parse_spec(spec)
+        if provider == "gemini" and GOOGLE_API_KEY:
+            out.append(f"gemini:{model or GEMINI_MODEL}")
+        elif provider == "nim" and NVIDIA_API_KEY:
+            out.append(f"nim:{model or NIM_MODEL}")
+        elif provider == "ollama" and USE_OLLAMA:
+            out.append(f"ollama:{model or OLLAMA_MODEL}")
+    return out
 
 
 def configured_tiers() -> list[str]:
-    """Which tiers are active, in fallback order — handy for a /health check."""
-    out = []
-    if NVIDIA_API_KEY:
-        out.append(f"nim:{NIM_MODEL}")
-        out.append(f"nim-router:{NIM_ROUTER_MODEL}")
-    if GOOGLE_API_KEY:
-        out.append(f"gemini:{GEMINI_MODEL}")
-    if USE_OLLAMA:
-        out.append(f"ollama:{OLLAMA_MODEL}")
+    """Active tiers in effective order — chat chain first, then router.
+    Handy for a /health check."""
+    out = _labels_for(GEN_TIER_ORDER)
+    out += [f"router:{lbl}" for lbl in _labels_for(ROUTER_TIER_ORDER)]
     return out
 
 

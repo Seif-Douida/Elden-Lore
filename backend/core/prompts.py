@@ -23,6 +23,7 @@ choose between.
 
 from __future__ import annotations
 
+import re
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -31,11 +32,15 @@ if TYPE_CHECKING:
 
 # ── Context assembly ──────────────────────────────────────────────────────────
 
-def format_context(chunks: list["RetrievedChunk"], max_chars: int = 6000) -> str:
+def format_context(chunks: list["RetrievedChunk"], max_chars: int = 12000) -> str:
     """
     Format retrieved chunks into a grounded context block. Each chunk is labelled
     with its source (title · section) so the model can attribute facts, and we
     cap total length so the prompt stays within budget.
+
+    We `continue` (not `break`) past an over-budget chunk so one long early chunk
+    doesn't drop all the later (often more on-point) ones — keep packing what fits.
+    Gemma's context window easily absorbs 12k chars.
     """
     if not chunks:
         return "(no relevant wiki passages were retrieved)"
@@ -48,28 +53,54 @@ def format_context(chunks: list["RetrievedChunk"], max_chars: int = 6000) -> str
             src += f" · {c.section_heading}"
         block = f"=== {src} ===\n{c.raw_text}"
         if total + len(block) > max_chars:
-            break
+            continue
         blocks.append(block)
         total += len(block)
     return "\n\n".join(blocks)
 
 
-def format_sources(chunks: list["RetrievedChunk"]) -> list[dict]:
+def _norm_text(s: str) -> str:
+    """Lowercase, punctuation→space, collapse whitespace — for tolerant matching."""
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).split())
+
+
+def _named_in_answer(title: str, answer_norm: str) -> bool:
+    """Is this page's title mentioned in the (normalized) answer text?"""
+    t = _norm_text(title)
+    return bool(t) and t in answer_norm
+
+
+def format_sources(
+    chunks: list["RetrievedChunk"],
+    entity_focus: Optional[list[str]] = None,
+    answer_text: Optional[str] = None,
+) -> list[dict]:
     """
     Structured source list for the UI's source cards (deduped by url).
-    Returned alongside the answer; not part of the prompt.
+
+    When `answer_text` is given, gate cards to pages the answer actually draws on
+    — the resolved entity page(s), or any page whose title is named in the answer
+    — so refusals/enumerations don't spray tangential cards. Without answer_text
+    (e.g. legacy callers) it returns one card per retrieved page as before.
     """
+    entity_norm = {e.lower() for e in (entity_focus or [])}
+    answer_norm = _norm_text(answer_text) if answer_text else ""
+
     seen: set[str] = set()
     sources: list[dict] = []
     for c in chunks:
         if c.url in seen:
             continue
+        if answer_norm:
+            keep = (c.title.lower() in entity_norm) or _named_in_answer(c.title, answer_norm)
+            if not keep:
+                continue
         seen.add(c.url)
         sources.append({
             "title": c.title,
             "url": c.url,
             "section": c.section_heading,
-            "image_url": c.image_url,
+            "image_url": c.image_url or None,   # guard empty string → no broken img slot
             "category": c.category,
         })
     return sources
@@ -85,7 +116,18 @@ _NON_VISUAL_TITLE_HINTS = (
     # Category/index hub pages — images are generic wiki graphics, not visual subjects
     "bosses", "items", "locations", "weapons", "npcs", "npc",
     "armor", "shields", "sorceries", "incantations", "talismans",
-    "ashes of war", "spells",
+    "ashes of war", "spells", "endings", "great runes", "spirit ashes",
+    "crystal tears", "cookbooks", "creatures", "merchants",
+    # Weapon/magic SUB-category hubs (plural forms; individual items use singular
+    # titles, so these won't false-match e.g. "Knight's Greatsword").
+    "daggers", "straight swords", "greatswords", "colossal swords",
+    "colossal weapons", "thrusting swords", "heavy thrusting swords",
+    "curved swords", "curved greatswords", "katanas", "twinblades",
+    "axes", "greataxes", "hammers", "great hammers", "flails",
+    "spears", "great spears", "halberds", "reapers", "whips",
+    "fists", "bows", "light bows", "greatbows", "crossbows",
+    "ballistae", "glintstone staffs", "glintstone staves", "sacred seals",
+    "torches", "throwing blades",
 )
 
 
@@ -99,21 +141,30 @@ def _is_visual_page(title: str, category: str) -> bool:
 def select_images(
     chunks: list["RetrievedChunk"],
     entity_focus: Optional[list[str]] = None,
+    answer_text: Optional[str] = None,
     max_images: int = 4,
 ) -> list[dict]:
     """
-    Entity-driven, contribution-ranked image selection.
+    Answer-gated, contribution-ranked image selection.
 
     The number of images is DYNAMIC — it follows how many distinct relevant
     subject-pages the answer actually draws on. A focused item/boss question
     yields one or two; a sweeping lore answer yields several (the entity, plus
     the other pages it weaves together).
 
-    Relevance bar (tightened after live testing showed tangential images):
-      - The resolved-entity page always qualifies.
+    Relevance bar (tightened after live testing showed tangential images on
+    refusals/enumerations):
+      - The resolved-entity page always qualifies (it's the subject).
       - Other pages qualify only if they contributed >= MIN_CONTRIB chunks OR
-        ranked highly (best score >= STRONG_SCORE). A single weak tangential
-        chunk no longer earns an image slot.
+        ranked highly (best score >= STRONG_SCORE) AND their title is actually
+        NAMED in the answer. This drops tangential pages the answer never talks
+        about (e.g. Ghostflame Dragon on a smithing-stone count) and clears
+        images on refusals (which name no wiki page).
+
+    NOTE: the router's `needs_image` flag is deliberately NOT used as a gate — the
+    8B router sets it unreliably (it returned False for "where is Moonveil?"), and
+    hard-suppressing on it dropped legit entity images. Answer-mention gating is
+    the robust filter instead.
 
     Order:
       1. The resolved entity's OWN page image(s) first.
@@ -122,6 +173,7 @@ def select_images(
     """
     entity_focus = entity_focus or []
     entity_norm = {e.lower() for e in entity_focus}
+    answer_norm = _norm_text(answer_text) if answer_text else ""
 
     MIN_CONTRIB = 2       # a non-entity page needs >=2 chunks to earn an image
     STRONG_SCORE = 0.74   # ...unless a single chunk scored this strongly
@@ -144,17 +196,29 @@ def select_images(
         p["count"] += 1
         p["best"] = max(p["best"], c.final_score if c.boost else c.score)
 
-    # Apply the relevance bar: entity pages always qualify; others must clear
-    # the contribution or score threshold.
-    qualified = [
-        p for p in pages.values()
-        if p["is_entity"] or p["count"] >= MIN_CONTRIB or p["best"] >= STRONG_SCORE
-    ]
+    # Apply the relevance bar: entity pages always qualify; other pages must
+    # clear the contribution/score threshold AND (when we know the answer) be
+    # named in it, so tangential pages and refusals don't attach images.
+    def _qualifies(p: dict) -> bool:
+        if p["is_entity"]:
+            return True
+        if not (p["count"] >= MIN_CONTRIB or p["best"] >= STRONG_SCORE):
+            return False
+        if answer_norm and not _named_in_answer(p["title"], answer_norm):
+            return False
+        return True
 
-    # Rank: entity pages first, then by contribution (count), then by best score.
+    qualified = [p for p in pages.values() if _qualifies(p)]
+
+    # Rank by SPECIFICITY, not volume: entity page first, then pages actually
+    # named in the answer, then best score, then chunk count last. (Previously
+    # count outranked score, so a generic hub that merely contributed more chunks
+    # — e.g. the "Endings" page — beat the specific on-topic page.)
+    def _named(p: dict) -> bool:
+        return bool(answer_norm) and _named_in_answer(p["title"], answer_norm)
     ranked = sorted(
         qualified,
-        key=lambda p: (p["is_entity"], p["count"], p["best"]),
+        key=lambda p: (p["is_entity"], _named(p), p["best"], p["count"]),
         reverse=True,
     )
 
@@ -184,6 +248,29 @@ stats, or steps that aren't supported there.
 player might ask instead — don't guess.
 - Be well-organized and concise. Use short paragraphs or tight lists for steps, \
 drops, or locations.
+- ENUMERATION: when the context includes a "COMPLETE LIST" block (a category total \
+plus example items), state the EXACT total count and list the given examples. If the \
+total exceeds the examples shown, tell the player they can see the full list on the \
+linked wiki page or ask about a specific item. Never invent items to pad a list, and \
+never dump a huge list. (e.g. "There are 108 talismans; notable ones include … — want \
+details on a specific one, or the full list on the wiki?")
+- COUNTING FROM A LIST: if the player asks "how many" and there is no explicit total \
+in the context, but the context DOES lay out the specific instances or locations (e.g. \
+a "Where to Find" list of spots where an item is found), count those and give the \
+number — make clear it's the count of locations/instances listed in the wiki (e.g. \
+"The wiki lists 6 places to find a Larval Tear in the base game, plus more in the DLC."). \
+Only count what's actually listed; don't invent entries to reach a rounder number. \
+- GUIDES: for multi-step content (questlines, endings), give the full ordered \
+sequence the context supports. If the context only covers part of it, say so plainly \
+and invite the player to ask for the next steps.
+- FOCUS: answer what was asked directly. Note prerequisites or caveats briefly, but \
+do not dwell on tangential conditions at the expense of the main answer.
+- For broad questline or overview questions, you may close by offering a focused next \
+step — e.g. "Would you like the full step-by-step walkthrough for X?"
+- CONFIRMATIONS: if the player's message is a brief affirmation ("Yes", "sure", "ok", \
+"please", "go ahead") that accepts an offer or question from the recent conversation, \
+treat it as a request to fulfil that offer using the retrieved context — do NOT reply \
+that they haven't asked a question.
 - Your response must be pure answer prose. Do NOT reference context passage \
 numbers (e.g. never write "[1]", "passage [2]", "according to context [3]", \
 "the context passage you're referring to is [N]", or any similar phrasing). \
@@ -246,12 +333,24 @@ CRYPTIC_SYSTEM = CRYPTIC_RESTRAINED
 
 # ── Message assembly ──────────────────────────────────────────────────────────
 
+def format_roster(group: str, titles: list[str], max_show: int = 15) -> str:
+    """A precise category roster (from Qdrant metadata) for enumeration questions:
+    the EXACT total count + a capped sample. Lets the model state the count, list a
+    few, and point to the wiki — instead of hallucinating or dumping a huge list."""
+    n = len(titles)
+    shown = titles[:max_show]
+    return (f"COMPLETE LIST — {group}: {n} total. "
+            f"Examples ({len(shown)} of {n}): {', '.join(shown)}.")
+
+
 def build_messages(
     question: str,
     chunks: list["RetrievedChunk"],
     tone: str = "scholar",
     history: Optional[str] = None,
     cryptic_variant: Optional[str] = None,
+    enumerate_group: Optional[str] = None,
+    roster: Optional[list[str]] = None,
 ) -> list[tuple[str, str]]:
     """
     Assemble the (role, content) message list for the LLM.
@@ -259,6 +358,8 @@ def build_messages(
     tone: "scholar" | "cryptic"
     cryptic_variant: optionally pass CRYPTIC_STRONG or CRYPTIC_RESTRAINED to
         override the default; ignored for scholar.
+    roster: for enumeration questions, the metadata-derived list of titles under
+        `enumerate_group` — injected as an authoritative COMPLETE LIST block.
     """
     if tone == "cryptic":
         system = cryptic_variant or CRYPTIC_SYSTEM
@@ -270,6 +371,8 @@ def build_messages(
     human_parts = []
     if history:
         human_parts.append(f"Recent conversation:\n{history}\n")
+    if roster and enumerate_group:
+        human_parts.append(format_roster(enumerate_group, roster) + "\n")
     human_parts.append(f"Wiki reference material:\n{context}\n")
     human_parts.append(f"Player's question: {question}")
     human = "\n".join(human_parts)

@@ -43,11 +43,21 @@ load_dotenv()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
 EMBED_MODEL = "BAAI/bge-base-en-v1.5"
 COLLECTION  = os.getenv("QDRANT_COLLECTION_NAME", "elden_ring")
 QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
+# TLS: local Qdrant is http (even with an api key set), Qdrant Cloud is https.
+# Explicit opt-in so local behaviour is unchanged; set QDRANT_HTTPS=true in cloud.
+QDRANT_HTTPS = _env_bool("QDRANT_HTTPS", default=False)
 
 # bge-*-v1.5 short-query→passage retrieval: prepend this to the QUERY only.
 QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages:"
@@ -154,7 +164,7 @@ class Retriever:
             host=QDRANT_HOST,
             port=QDRANT_PORT,
             api_key=QDRANT_API_KEY,
-            https=False,
+            https=QDRANT_HTTPS,
             check_compatibility=False,
         )
 
@@ -177,6 +187,66 @@ class Retriever:
         if doc_type:
             must.append(FieldCondition(key="doc_type", match=MatchValue(value=doc_type)))
         return Filter(must=must) if must else None
+
+    # ── enumeration (metadata aggregation, not vector search) ────────────────
+    def enumerate_titles(self, group: str, category: Optional[str] = None,
+                         doc_type: Optional[str] = "page", limit: int = 2000) -> list[str]:
+        """
+        DISTINCT page titles under a wiki category, via payload metadata — e.g.
+        group="Katanas" returns every page whose `breadcrumb` array contains
+        "Katanas" (a MatchValue on the keyword-list field). This answers "how many
+        X / list all X" precisely, where vector top-k + the context cap cannot.
+        Returns [] if the group matches nothing (caller falls back to normal RAG).
+
+        Special case "<X> Sets" (e.g. "Armor Sets"): full sets and individual
+        pieces share the same breadcrumb ("Armor"), and only complete sets have a
+        title ending in " Set" (pieces are "Alberich's Pointed Hat" etc.). So we
+        search under breadcrumb X and keep only the " Set" titles — the way to
+        count sets distinct from pieces.
+        """
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        title_suffix: Optional[str] = None
+        g = group.strip()
+        if g.lower().endswith(" sets"):
+            group = g[: -len(" sets")].strip()   # "Armor Sets" → breadcrumb "Armor"
+            title_suffix = " Set"
+        must = [FieldCondition(key="breadcrumb", match=MatchValue(value=group))]
+        if category:
+            must.append(FieldCondition(key="category", match=MatchValue(value=category)))
+        if doc_type:
+            must.append(FieldCondition(key="doc_type", match=MatchValue(value=doc_type)))
+        qfilter = Filter(must=must)
+
+        import re
+        _UPGRADE = re.compile(r"\s*\+\d+$")   # "Arsenal Charm +1" → "Arsenal Charm"
+
+        titles: list[str] = []
+        seen: set[str] = set()
+        offset = None
+        fetched = 0
+        while True:
+            points, offset = self._client.scroll(
+                collection_name=COLLECTION,
+                scroll_filter=qfilter,
+                with_payload=["title"],
+                with_vectors=False,
+                limit=256,
+                offset=offset,
+            )
+            for p in points:
+                t = (p.payload or {}).get("title")
+                if not t:
+                    continue
+                if title_suffix and not t.endswith(title_suffix):
+                    continue                          # e.g. keep only "* Set" pages
+                base = _UPGRADE.sub("", t).strip()   # collapse upgrade variants
+                if base and base not in seen:
+                    seen.add(base)
+                    titles.append(base)
+            fetched += len(points)
+            if offset is None or fetched >= limit:
+                break
+        return sorted(titles)
 
     # ── structural boost ─────────────────────────────────────────────────────
     @staticmethod
