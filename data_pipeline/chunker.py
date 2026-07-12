@@ -124,6 +124,8 @@ class Chunk:
     entities:        list[str]
     image_url:       Optional[str]
     source_type:     str = "wiki"
+    facets:          dict = field(default_factory=dict)   # flat, filterable (on every chunk)
+    stats:           dict = field(default_factory=dict)   # full stat card (Stats chunk only)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -283,6 +285,144 @@ def tag_entities(text: str, nlp, matcher, canon_by_lower) -> list[str]:
     return sorted(found)
 
 
+# ── Facets & structured stats ─────────────────────────────────────────────────
+
+# Weapon-type breadcrumb leaves carry wiki-side typos/variants that fragment
+# enumeration ("Glintstone Staffs" vs "Glinstone Staves"). Canonicalize them.
+_WEAPON_TYPE_CANON = {
+    "glinstone staves": "Glintstone Staffs",
+    "glintstone staves": "Glintstone Staffs",
+    "ballistas":         "Ballistae",
+}
+
+
+_DLC_MARKERS = ("shadow of the erdtree", "realm of shadow", "land of shadow")
+
+
+def _is_dlc(page: dict) -> bool:
+    """Heuristic DLC flag: a DLC-specific phrase in the page intro. Items say "brand
+    new … in the Shadow of the Erdtree DLC"; bosses/locations instead sit "in the
+    Realm/Land of Shadow" — the earlier item-only heuristic missed those. Restricted
+    to the intro so base pages that merely reference the DLC later aren't tagged."""
+    intro = page.get("body_text", "")[:2000].lower()
+    return any(m in intro for m in _DLC_MARKERS)
+
+
+def _canon_weapon_type(leaf: str) -> str:
+    return _WEAPON_TYPE_CANON.get(leaf.lower().strip(), leaf)
+
+
+def compute_facets(page: dict, stats: dict) -> dict:
+    """Flat, filterable facets attached to EVERY chunk of a page."""
+    f: dict = {"dlc": _is_dlc(page), "subject": page.get("title", "")}
+    bc = page.get("breadcrumb", [])
+    if "Weapons" in bc and len(bc) >= 3:
+        f["weapon_type"] = _canon_weapon_type(bc[-1])
+    for attr in ("str", "dex", "int", "fai", "arc"):
+        g = stats.get("scaling", {}).get(attr)
+        if g:
+            f[f"scaling_{attr}"] = g
+    if isinstance(stats.get("weight"), (int, float)):
+        f["weight"] = stats["weight"]
+    if isinstance(stats.get("fp_cost"), int):
+        f["fp_cost"] = stats["fp_cost"]
+    if stats.get("weak_to"):
+        f["weak_to"] = stats["weak_to"]
+    return f
+
+
+def stats_text(stats: dict) -> str:
+    """One readable block for a stat card, so the (otherwise payload-only) numbers
+    are embedded + retrievable — answers 'give me the stats of X'. The Scaling row
+    especially is dropped from body_text by the scraper's nav filter, so this is
+    the only place those grades reach the embedding."""
+    def _kv(d: dict) -> str:
+        return ", ".join(f"{k.title()} {v}" for k, v in d.items())
+    parts: list[str] = []
+    if stats.get("attack"):
+        parts.append("Attack — " + _kv(stats["attack"]))
+    if stats.get("scaling"):
+        parts.append("Scaling — " + _kv(stats["scaling"]))
+    if stats.get("requires"):
+        parts.append("Requires — " + _kv(stats["requires"]))
+    for k, lab in (("weight", "Weight"), ("fp_cost", "FP Cost"), ("slots", "Slots")):
+        if stats.get(k) is not None:
+            parts.append(f"{lab} {stats[k]}")
+    if stats.get("weak_to"):
+        parts.append("Weak to " + ", ".join(stats["weak_to"]))
+    if stats.get("strong_vs"):
+        parts.append("Strong vs " + ", ".join(stats["strong_vs"]))
+    return ". ".join(parts)
+
+
+# ── Entity denoise ────────────────────────────────────────────────────────────
+# The gazetteer matcher tags EVERY page-title/link name in a chunk, so a chunk
+# averages ~13 entity tags — mostly noise (breadcrumb nodes, the game name,
+# stat/mechanic words). That noise makes entity-filtering imprecise (a chunk that
+# merely MENTIONS Rennala matched a Rennala query). Denoise to the real entities,
+# and guarantee the page's own subject is present.
+
+_ENTITY_GLOBAL_STOP = {
+    "Elden Ring", "World Information", "Equipment & Magic", "Equipment", "Items",
+    "Creatures and Enemies", "Guides & Walkthroughs", "Key Items", "Armor",
+    "Weapons", "NPCs", "Bosses", "Locations", "Skills", "Magic",
+}
+_ENTITY_STAT_STOP = {
+    "Str", "Dex", "Int", "Fai", "Arc", "Strength", "Dexterity", "Intelligence",
+    "Faith", "Arcane", "Fire", "Light", "Holy", "Lightning", "Physical", "Magic",
+    "Slash", "Strike", "Pierce", "Standard", "Combat", "Death", "HP", "FP",
+    "Info", "Page", "Skill",
+}
+
+
+def _denoise_entities(ents: list[str], breadcrumb: list[str], title: str) -> list[str]:
+    crumb = set(breadcrumb)
+    out: list[str] = []
+    for e in ents:
+        if e in _ENTITY_GLOBAL_STOP or e in _ENTITY_STAT_STOP or e in crumb:
+            continue
+        if e.islower():            # generic mechanic words: "daggers", "skill", "intelligence"
+            continue
+        out.append(e)
+    # The page's subject is always a valid tag for its own chunks (aboutness).
+    if title and title not in out and title not in _ENTITY_GLOBAL_STOP:
+        out.insert(0, title)
+    return out
+
+
+# ── In-chunk deduplication ────────────────────────────────────────────────────
+# Fextralife renders some blocks twice (mobile + desktop, or list items echoed),
+# so ~6% of chunks carry a repeated sentence or phrase ("Video Location Video
+# Location"; a drops list printed twice). This also corrupted counts (the somber-
+# stone "says 6, lists 4" case). Collapse both, word-based (no regex backtracking).
+
+def _dedup_text(text: str) -> str:
+    # 1. Drop an adjacent duplicate sentence.
+    sents: list[str] = []
+    for p in re.split(r"(?<=[.!?])\s+", text):
+        if not sents or p.strip().lower() != sents[-1].strip().lower():
+            sents.append(p)
+    text = " ".join(sents)
+    # 2. Collapse an immediately repeated word-run (up to 8 words), e.g.
+    #    "A B C A B C" → "A B C". Greedy on the longest run at each position.
+    words = text.split()
+    out: list[str] = []
+    i, n = 0, len(words)
+    while i < n:
+        run = 0
+        for L in range(min(8, (n - i) // 2), 0, -1):
+            if words[i:i + L] == words[i + L:i + 2 * L]:
+                run = L
+                break
+        if run:
+            out.extend(words[i:i + run])
+            i += 2 * run
+        else:
+            out.append(words[i])
+            i += 1
+    return " ".join(out)
+
+
 # ── Chunk id ──────────────────────────────────────────────────────────────────
 
 def make_chunk_id(url: str, chunk_type: str, idx: int) -> str:
@@ -300,20 +440,26 @@ def chunk_page(page: dict, ent_ctx) -> list[Chunk]:
     breadcrumb = page.get("breadcrumb", [])
     image_url  = page.get("image_url")
 
+    stats  = page.get("stats", {}) or {}
+    facets = compute_facets(page, stats)
+
     chunks: list[Chunk] = []
     idx = 0
 
-    def emit(raw: str, section: str, chunk_type: str) -> None:
+    def emit(raw: str, section: str, chunk_type: str,
+             stats_dict: Optional[dict] = None, allow_short: bool = False) -> None:
         nonlocal idx
-        raw = raw.strip()
-        # Drop placeholder fragments and anything too small to be meaningful
-        if not raw or len(raw) < MIN_CHUNK_CHARS:
+        raw = _dedup_text(raw.strip())
+        # Drop placeholder fragments and anything too small to be meaningful.
+        # `allow_short` exempts the structured Stats chunk (e.g. a boss's short
+        # "Weak to Slash" line), which is always meaningful despite its length.
+        if not raw or (not allow_short and len(raw) < MIN_CHUNK_CHARS):
             return
         if _PLACEHOLDER_RE.search(raw):
             return
         prefix = build_prefix(breadcrumb, title, section)
         text = f"{prefix}\n{raw}"
-        ents = tag_entities(text, nlp, matcher, canon)
+        ents = _denoise_entities(tag_entities(text, nlp, matcher, canon), breadcrumb, title)
         if len(ents) > MAX_ENTITIES_PER_CHUNK:
             ents = ents[:MAX_ENTITIES_PER_CHUNK]
         chunks.append(Chunk(
@@ -329,8 +475,17 @@ def chunk_page(page: dict, ent_ctx) -> list[Chunk]:
             chunk_type=chunk_type,
             entities=ents,
             image_url=image_url,
+            facets=facets,               # flat facets on every chunk of the page
+            stats=stats_dict or {},      # full stat card only on the Stats chunk
         ))
         idx += 1
+
+    # 0. Structured stats → a readable, retrievable "Stats" chunk. The Scaling row
+    #    (and boss weaknesses, spell FP/slots) are dropped from body_text by the
+    #    scraper's nav filter, so this is where those numbers reach the embedding.
+    st = stats_text(stats)
+    if st:
+        emit(st, "Stats", "body", stats_dict=stats, allow_short=True)
 
     # 1. Body — section-aware, then sentence-packed
     for heading, content in split_sections(page.get("body_text", "")):
@@ -396,7 +551,14 @@ def run(limit: Optional[int] = None, verbose: bool = False,
         for page in pages:
             progress.update(task, advance=1, description=f"[cyan]{page['title'][:40]}")
             for ch in chunk_page(page, ent_ctx):
-                h = hashlib.md5(ch.raw_text.encode()).hexdigest()
+                # Dedup PER PAGE (url + text), not globally: some distinct pages
+                # legitimately share content (a boss's phase-variant page, numbered
+                # item variants). A global raw_text dedup orphaned the second page
+                # entirely — losing its chunks AND its subject/facets (e.g. Messmer
+                # the Impaler ceded all 55 chunks to Base Serpent Messmer). Keying on
+                # the url keeps each page complete while still dropping intra-page
+                # repeats (the HTML block-duplication).
+                h = hashlib.md5((ch.url + "\n" + ch.raw_text).encode()).hexdigest()
                 if h in seen_hashes:
                     dropped_dupes += 1
                     continue

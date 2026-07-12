@@ -229,7 +229,7 @@ def main() -> None:
     console = Console()
 
     question = " ".join(args.question) or "Tell me the story of Queen Marika"
-    console.print(f"[dim]Loading assistant…[/dim]")
+    console.print("[dim]Loading assistant…[/dim]")
     assistant = Assistant()
 
     console.print(f"\n[bold cyan]Q:[/bold cyan] {question}\n")

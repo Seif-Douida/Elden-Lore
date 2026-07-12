@@ -1,6 +1,5 @@
 # docker-compose.yml
-# Local development: Qdrant only
-# Production (GCP e2-micro): add ollama service here later
+# Local development: Qdrant only (LLMs are hosted — Gemma via Google, NIM via NVIDIA)
 
 services:
   qdrant:

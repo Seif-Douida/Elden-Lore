@@ -71,6 +71,12 @@ SECTION_BOOST     = 0.05   # chunk's section_heading matches the query intent
 BREADCRUMB_BOOST  = 0.03   # chunk's breadcrumb/category matches the query intent
 CHUNKTYPE_BOOST   = 0.05   # chunk_type matches the intent (e.g. dialogue)
 DIVERSITY_PENALTY = 0.04   # per extra chunk from the same page beyond the 2nd
+SUBJECT_BOOST     = 0.06   # chunk's page IS about a focus entity (vs merely mentions it)
+
+# Scaling grades are stored as keywords; a ">= C" query can't range-compare a
+# keyword, so we expand a threshold into the set of qualifying grades for MatchAny
+# (see Retriever._facet_conditions).
+_GRADE_ORDER = {"S": 6, "A": 5, "B": 4, "C": 3, "D": 2, "E": 1}
 
 # Intent profiles: which structural values each query-intent should favour.
 # Matching is case-insensitive substring against the chunk's fields.
@@ -81,7 +87,8 @@ INTENT_PROFILES: dict[str, dict[str, set[str]]] = {
         "chunk_types": set(),
     },
     "strategy": {
-        "sections":    {"fight strategy", "attacks & counters", "attacks", "combat", "strategy"},
+        "sections":    {"fight strategy", "attacks & counters", "attacks", "combat",
+                        "strategy", "stats"},   # "stats" → the Stats chunk (weak_to/strong_vs)
         "crumb":       {"bosses"},
         "chunk_types": set(),
     },
@@ -107,7 +114,7 @@ INTENT_PROFILES: dict[str, dict[str, set[str]]] = {
     },
     "summary": {
         "sections":    {"overview", "list", "all bosses", "main bosses",
-                        "achievement", "complete list", "full list", "all"},
+                        "achievement", "complete list", "full list", "all", "stats"},
         "crumb":       set(),
         "chunk_types": {"body", "item_desc"},
     },
@@ -147,6 +154,7 @@ class RetrievedChunk:
     entities:        list[str]
     image_url:       Optional[str]
     source_type:     str
+    subject:         str = ""              # the page's own entity (facet); "" pre-re-scrape
 
 
 # ── Retriever ─────────────────────────────────────────────────────────────────
@@ -175,7 +183,7 @@ class Retriever:
         return vec.tolist()
 
     # ── filter builder ───────────────────────────────────────────────────────
-    def _build_filter(self, entities, category, chunk_type, doc_type):
+    def _build_filter(self, entities, category, chunk_type, doc_type, facets=None):
         from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchAny
         must = []
         if entities:
@@ -186,35 +194,92 @@ class Retriever:
             must.append(FieldCondition(key="chunk_type", match=MatchValue(value=chunk_type)))
         if doc_type:
             must.append(FieldCondition(key="doc_type", match=MatchValue(value=doc_type)))
+        must.extend(self._facet_conditions(facets))
         return Filter(must=must) if must else None
 
-    # ── enumeration (metadata aggregation, not vector search) ────────────────
-    def enumerate_titles(self, group: str, category: Optional[str] = None,
-                         doc_type: Optional[str] = "page", limit: int = 2000) -> list[str]:
+    @staticmethod
+    def _facet_conditions(facets: Optional[dict]):
+        """Turn a facet dict into Qdrant conditions. Supports:
+          {"dlc": True}                     → bool match
+          {"weapon_type": "Katanas"}        → keyword match
+          {"weak_to": ["Fire", "Holy"]}     → keyword MatchAny (list value)
+          {"scaling_dex_min": "C"}          → grade ≥ C  (expands to {S,A,B,C})
+          {"weight_min": 10, "weight_max": 30} → numeric Range on a facet
         """
-        DISTINCT page titles under a wiki category, via payload metadata — e.g.
-        group="Katanas" returns every page whose `breadcrumb` array contains
-        "Katanas" (a MatchValue on the keyword-list field). This answers "how many
-        X / list all X" precisely, where vector top-k + the context cap cannot.
-        Returns [] if the group matches nothing (caller falls back to normal RAG).
+        from qdrant_client.models import FieldCondition, MatchValue, MatchAny, Range
+        conds = []
+        for key, val in (facets or {}).items():
+            if key.endswith("_min") or key.endswith("_max"):
+                base = key[:-4]
+                if base.startswith("scaling_"):        # grade threshold → keyword set
+                    thr = _GRADE_ORDER.get(str(val).upper(), 0)
+                    if not thr:
+                        continue                        # unknown grade → skip (don't filter)
+                    if key.endswith("_min"):
+                        grades = [g for g, v in _GRADE_ORDER.items() if v >= thr]
+                    else:
+                        grades = [g for g, v in _GRADE_ORDER.items() if 0 < v <= thr]
+                    if grades:                          # never an empty MatchAny (Qdrant panics)
+                        conds.append(FieldCondition(key=base, match=MatchAny(any=grades)))
+                else:                                   # numeric range (weight, fp_cost)
+                    try:
+                        num = float(val)
+                    except (TypeError, ValueError):
+                        continue
+                    rng = Range(gte=num) if key.endswith("_min") else Range(lte=num)
+                    conds.append(FieldCondition(key=base, range=rng))
+            elif isinstance(val, (list, tuple)):
+                vals = [x for x in val if x not in (None, "")]
+                if vals:                                # skip empty MatchAny (Qdrant panics)
+                    conds.append(FieldCondition(key=key, match=MatchAny(any=vals)))
+            elif val not in (None, ""):                 # bool / keyword / number
+                conds.append(FieldCondition(key=key, match=MatchValue(value=val)))
+        # Scaling grades are meaningful only for weapons. Throwing consumables
+        # (Hefty Rock Pot, Explosive Stone…) also carry a scaling_* value, so a bare
+        # scaling facet would surface them for "best STR/DEX weapon" queries. Scope
+        # any scaling facet to weapon pages ('Weapons' is an element of every weapon's
+        # breadcrumb array; consumables have 'Items'/'Consumables' instead).
+        if any(str(k).startswith("scaling_") for k in (facets or {})):
+            conds.append(FieldCondition(key="breadcrumb", match=MatchValue(value="Weapons")))
+        return conds
+
+    # ── enumeration (metadata aggregation, not vector search) ────────────────
+    def enumerate_titles(self, group: Optional[str] = None,
+                         category: Optional[str] = None,
+                         doc_type: Optional[str] = "page",
+                         facets: Optional[dict] = None,
+                         limit: int = 2000) -> list[str]:
+        """
+        DISTINCT page titles matching a metadata filter — e.g. group="Katanas"
+        returns every page whose `breadcrumb` array contains "Katanas". This
+        answers "how many X / list all X" precisely, where vector top-k + the
+        context cap cannot. Returns [] if nothing matches (caller falls back).
+
+        `facets` adds structured constraints, and works WITH or WITHOUT a group:
+          enumerate_titles("Katanas", facets={"dlc": True})   → DLC katanas
+          enumerate_titles(facets={"scaling_dex_min": "C"})   → all Dex-scaling weapons
 
         Special case "<X> Sets" (e.g. "Armor Sets"): full sets and individual
         pieces share the same breadcrumb ("Armor"), and only complete sets have a
         title ending in " Set" (pieces are "Alberich's Pointed Hat" etc.). So we
-        search under breadcrumb X and keep only the " Set" titles — the way to
-        count sets distinct from pieces.
+        search under breadcrumb X and keep only the " Set" titles.
         """
         from qdrant_client.models import Filter, FieldCondition, MatchValue
+        must = []
         title_suffix: Optional[str] = None
-        g = group.strip()
-        if g.lower().endswith(" sets"):
-            group = g[: -len(" sets")].strip()   # "Armor Sets" → breadcrumb "Armor"
-            title_suffix = " Set"
-        must = [FieldCondition(key="breadcrumb", match=MatchValue(value=group))]
+        if group:
+            g = group.strip()
+            if g.lower().endswith(" sets"):
+                g = g[: -len(" sets")].strip()   # "Armor Sets" → breadcrumb "Armor"
+                title_suffix = " Set"
+            must.append(FieldCondition(key="breadcrumb", match=MatchValue(value=g)))
         if category:
             must.append(FieldCondition(key="category", match=MatchValue(value=category)))
         if doc_type:
             must.append(FieldCondition(key="doc_type", match=MatchValue(value=doc_type)))
+        must.extend(self._facet_conditions(facets))
+        if not must:
+            return []                            # refuse an unbounded scroll
         qfilter = Filter(must=must)
 
         import re
@@ -247,6 +312,47 @@ class Retriever:
             if offset is None or fetched >= limit:
                 break
         return sorted(titles)
+
+    def top_by_facet(self, facet: str, group: Optional[str] = None,
+                     category: Optional[str] = None, doc_type: Optional[str] = "page",
+                     facets: Optional[dict] = None, n: int = 15, desc: bool = True,
+                     limit: int = 4000) -> list[tuple[str, float]]:
+        """Titles ranked by a NUMERIC facet — answers superlatives ('heaviest armor'
+        → top_by_facet('weight', group='Armor'); 'cheapest sorcery' → ('fp_cost',
+        desc=False)). Returns [(title, value), …] best-first, deduped to the best
+        value per title."""
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        must = []
+        if group:
+            must.append(FieldCondition(key="breadcrumb", match=MatchValue(value=group)))
+        if category:
+            must.append(FieldCondition(key="category", match=MatchValue(value=category)))
+        if doc_type:
+            must.append(FieldCondition(key="doc_type", match=MatchValue(value=doc_type)))
+        must.extend(self._facet_conditions(facets))
+        if not must:
+            return []
+        qfilter = Filter(must=must)
+        best: dict[str, float] = {}
+        offset = None
+        fetched = 0
+        while True:
+            points, offset = self._client.scroll(
+                collection_name=COLLECTION, scroll_filter=qfilter,
+                with_payload=["title", facet], with_vectors=False,
+                limit=256, offset=offset,
+            )
+            for p in points:
+                pl = p.payload or {}
+                t, v = pl.get("title"), pl.get(facet)
+                if not t or not isinstance(v, (int, float)):
+                    continue
+                if t not in best or (v > best[t] if desc else v < best[t]):
+                    best[t] = v
+            fetched += len(points)
+            if offset is None or fetched >= limit:
+                break
+        return sorted(best.items(), key=lambda kv: kv[1], reverse=desc)[:n]
 
     # ── structural boost ─────────────────────────────────────────────────────
     @staticmethod
@@ -301,10 +407,11 @@ class Retriever:
         boost_breadcrumb:  bool = False,
         boost_chunktype:   bool = False,
         diversity_penalty: bool = False,
+        facets:     Optional[dict] = None,
         fetch_k:    int = DEFAULT_FETCH_K,
     ) -> list[RetrievedChunk]:
         vector = self.embed_query(query)
-        qfilter = self._build_filter(entities, category, chunk_type, doc_type)
+        qfilter = self._build_filter(entities, category, chunk_type, doc_type, facets)
 
         any_boost = (
             (intent and (boost_section or boost_breadcrumb or boost_chunktype))
@@ -339,17 +446,46 @@ class Retriever:
                 entities=p.get("entities", []),
                 image_url=p.get("image_url"),
                 source_type=p.get("source_type", "wiki"),
+                subject=p.get("subject", ""),
             ))
 
-        if not any_boost or not candidates:
-            return candidates[:k]
+        if not candidates:
+            return candidates
 
-        self._apply_boost(
-            candidates, intent,
-            boost_section, boost_breadcrumb, boost_chunktype, diversity_penalty,
-        )
-        candidates.sort(key=lambda c: c.final_score, reverse=True)
-        return candidates[:k]
+        if any_boost:
+            self._apply_boost(
+                candidates, intent,
+                boost_section, boost_breadcrumb, boost_chunktype, diversity_penalty,
+            )
+
+        # Subject preference: a chunk whose page IS about a focus entity outranks
+        # one that merely mentions it (finishes the Larval-Tear→Rennala fix). Added
+        # AFTER _apply_boost, which overwrites .boost. No-op pre-re-scrape (no subject).
+        subject_hit = False
+        if entities:
+            eset = {e.lower() for e in entities}
+            for c in candidates:
+                if c.subject and c.subject.lower() in eset:
+                    c.boost += SUBJECT_BOOST
+                    c.final_score = c.score + c.boost
+                    subject_hit = True
+
+        if any_boost or subject_hit:
+            candidates.sort(key=lambda c: c.final_score, reverse=True)
+
+        # Drop cross-page duplicate chunks: per-page dedup at ingest keeps identical
+        # content under different urls (a boss's Fight Strategy on its own page AND on
+        # a walkthrough), so top-k could fill with 3 copies of one passage and crowd
+        # out distinct info (e.g. the Stats chunk with the weakness). Keep the
+        # highest-scored copy of each raw_text.
+        seen_text: set[str] = set()
+        deduped: list[RetrievedChunk] = []
+        for c in candidates:
+            if c.raw_text in seen_text:
+                continue
+            seen_text.add(c.raw_text)
+            deduped.append(c)
+        return deduped[:k]
 
     # ── LangChain bridge ─────────────────────────────────────────────────────
     def retrieve_documents(self, query: str, k: int = DEFAULT_TOP_K, **kwargs):

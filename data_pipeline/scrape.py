@@ -92,6 +92,53 @@ def _is_nav_list(text: str) -> bool:
     return sum(1 for s in segs if s and s[0].isupper()) / len(segs) > 0.7
 
 
+# Weapon/armor/shield/top-level CATEGORY names. The footer "related types" nav lists
+# (e.g. a Whips page listing Axes · Bows · Claws · …) are the main pure-navigation
+# lists that survive noise stripping — they are ≥60% category terms. Real content
+# lists (a boss roster, a drop table, the 9 legendary armaments) share none of these.
+_NAV_CATEGORY_TERMS = frozenset({
+    # weapon types
+    "daggers", "straight swords", "greatswords", "colossal swords", "colossal weapons",
+    "thrusting swords", "heavy thrusting swords", "light greatswords", "curved swords",
+    "curved greatswords", "katanas", "great katanas", "twinblades", "axes", "greataxes",
+    "hammers", "great hammers", "flails", "spears", "great spears", "halberds", "reapers",
+    "whips", "fists", "claws", "hand-to-hand arts", "backhand blades", "beast claws",
+    "perfume bottles", "throwing blades", "bows", "light bows", "greatbows", "crossbows",
+    "ballistas", "glintstone staffs", "sacred seals", "torches",
+    # shields
+    "small shields", "medium shields", "greatshields", "thrusting shields", "shields",
+    # armor slots
+    "helms", "chest armor", "gauntlets", "leg armor", "helm", "gauntlet", "greaves",
+    # top-level nav
+    "weapons", "armor", "talismans", "sorceries", "incantations", "spirit ashes",
+    "ashes of war", "skills", "items", "magic", "equipment", "spells", "creatures",
+    "bosses", "npcs", "locations", "maps", "classes",
+})
+
+
+def _is_category_nav(items: list[str]) -> bool:
+    """True if a list is a category/type navigation list (footer 'related types'),
+    not real content. Requires 4+ items that are ≥60% known category terms."""
+    if len(items) < 4:
+        return False
+    hits = sum(1 for it in items if it.strip().lower() in _NAV_CATEGORY_TERMS)
+    return hits / len(items) >= 0.6
+
+
+def _li_own_text(li: Tag) -> str:
+    """A list item's OWN text, excluding any nested <ul>/<ol> — those children are
+    emitted on their own iteration, so nothing gets merged/bundled into one line."""
+    parts: list[str] = []
+    for child in li.children:
+        name = getattr(child, "name", None)
+        if name in ("ul", "ol"):
+            continue
+        piece = child.get_text(" ", strip=True) if name else str(child).strip()
+        if piece:
+            parts.append(piece)
+    return _clean_body_line(" ".join(parts))
+
+
 # ── Image ─────────────────────────────────────────────────────────────────────
 
 def extract_image_url(soup: BeautifulSoup) -> Optional[str]:
@@ -433,8 +480,32 @@ def extract_body_text(soup: BeautifulSoup) -> str:
 
     out: list[str] = []
     seen_headings: set[str] = set()
+    nav_cache: dict[int, bool] = {}
+
+    def _list_is_nav(lst: Tag) -> bool:
+        lid = id(lst)
+        if lid not in nav_cache:
+            items = [_li_own_text(li) for li in lst.find_all("li", recursive=False)]
+            nav_cache[lid] = _is_category_nav([i for i in items if i])
+        return nav_cache[lid]
 
     for el in content.find_all(["p", "li", "h2", "h3", "h4", "td"]):
+        # ── List items ────────────────────────────────────────────────────────
+        # The old code filtered each <li> with len<20, silently dropping any
+        # short-named entry (4 of the 9 Legendary Armaments, boss stat rows, drop
+        # tables). Instead: keep each <li>'s OWN text (nested sub-lists handled on
+        # their own iteration, so nothing is merged/bundled), recovering short
+        # names — and drop only whole lists that are category/type NAVIGATION.
+        if el.name == "li":
+            text = _li_own_text(el)
+            if not text or _is_nav_list(text):
+                continue
+            lst = el.find_parent(["ul", "ol"])
+            if lst is not None and _list_is_nav(lst):
+                continue  # footer 'related types' nav — drop
+            out.append(text)
+            continue
+
         raw = el.get_text(separator=" ", strip=True)
         if not raw:
             continue

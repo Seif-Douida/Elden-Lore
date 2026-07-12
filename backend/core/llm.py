@@ -1,21 +1,22 @@
 """
 backend/core/llm.py
 
-The LLM layer: one interface, three providers, transparent fallback.
+The LLM layer: one interface, two providers, transparent fallback.
 
     CHAT (generation):  order set by GEN_TIER_ORDER, default:
-        Gemini Flash  ──fail──▶  NIM  ──fail──▶  Ollama (local)
-      primary                    fallback           last resort
-    ROUTER (structured):  NIM (llama-3.1-8b)  ──fail──▶  Gemini  ──fail──▶  Ollama
+        Gemma 4 (26b-a4b)  ──fail──▶  Gemma 4 (31b)  ──fail──▶  NIM
+      primary                         fallback                  cross-provider net
+    ROUTER (structured):  same Gemma-first order, NIM-8B as the cross-provider net.
 
-All three are LangChain BaseChatModels, so .invoke(), .stream(), and
+Both providers are LangChain BaseChatModels, so .invoke(), .stream(), and
 .with_structured_output() behave identically regardless of which tier answers.
 Downstream code (router, chat chain, summariser) calls one object and never
 needs to know who responded.
 
-The chat tier order is env-driven (GEN_TIER_ORDER) so the primary AND fallback are
-config, not code — flip it to A/B models without a code change. The router keeps a
-fixed NIM-first order (the 8B is fast and reliably does structured output).
+Both tier orders are env-driven (GEN_TIER_ORDER / ROUTER_TIER_ORDER) so the primary
+AND fallbacks are config, not code — flip to A/B models without a code change. Both
+default to Gemma-first, with the NIM 8B as the router's cross-provider net (it's fast
+and reliably does structured output).
 
 Resilience is graceful: a tier is only added to the chain if its credentials
 are present. Unconfigured tiers in the order are silently skipped. Fallback
@@ -32,44 +33,49 @@ Two separate NIM models are used:
                      nemotron-3-ultra-550b-a55b) — those calls hang indefinitely.
 
 Env (.env):
-    GOOGLE_API_KEY     enables Gemini (the default chat primary)
-    NVIDIA_API_KEY     enables NIM (chat fallback + router primary)
-    OLLAMA_HOST        enables the Ollama last resort (optional, default localhost)
-    GEN_TIER_ORDER     chat tier order, default: gemini,nim,ollama
-    GEMINI_MODEL       default: gemini-2.5-flash   (chat primary; try gemini-3-flash)
+    GOOGLE_API_KEY     enables Gemini/Gemma (the default chat + router primary)
+    NVIDIA_API_KEY     enables NIM (cross-provider fallback net)
+    GEN_TIER_ORDER     chat tier order, default: gemma-4-26b-a4b, gemma-4-31b, nim
+    GEMINI_MODEL       default: gemini-2.5-flash   (only if a bare 'gemini' spec is used)
     NIM_MODEL          default: nvidia/nemotron-3-ultra-550b-a55b  (chat fallback)
     NIM_ROUTER_MODEL   default: meta/llama-3.1-8b-instruct            (routing)
-    OLLAMA_MODEL       default: llama3.2:3b
 """
 
 from __future__ import annotations
 
+import logging
 import os
-from typing import Optional
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# The google-genai SDK logs at INFO on every call: an "AFC is enabled …" line
+# (automatic function calling — irrelevant to us) plus one line per internal retry.
+# On a flaky free-tier endpoint that's a wall of noise. Quiet to WARNING so real
+# problems still surface (our own api.conversations 'chat.done' log carries timings).
+for _noisy in ("google_genai.models", "google_genai._api_client"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY") or None
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or None
-OLLAMA_HOST    = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
 NIM_MODEL        = os.getenv("NIM_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
 NIM_ROUTER_MODEL = os.getenv("NIM_ROUTER_MODEL", "meta/llama-3.1-8b-instruct")
 GEMINI_MODEL     = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-OLLAMA_MODEL     = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 
-# Whether to attempt the local Ollama tier at all. Off unless explicitly enabled,
-# so a machine without Ollama doesn't pay a connection timeout on every fallback.
-USE_OLLAMA = os.getenv("USE_OLLAMA", "false").lower() in ("1", "true", "yes")
+# Per-tier retry budget for the Google SDK. The default is 6, which — with
+# exponential backoff — means a couple of transient 500s can burn 15-25s hammering
+# ONE endpoint before our own tier-fallback (→ 31b → NIM) ever engages. Keep it low
+# so a flaky endpoint fails over FAST; the multi-tier chain is the real resilience.
+GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "2"))
 
 # Tier orders are lists of "provider:model" specs (primary first), env-driven so
 # the primary AND fallbacks are config, not code. A bare "provider" uses that
-# provider's default model. Providers: gemini (Google, incl. Gemma), nim (NVIDIA),
-# ollama (local). Unconfigured tiers (missing creds) are skipped at assembly.
+# provider's default model. Providers: gemini (Google, incl. Gemma), nim (NVIDIA).
+# Unconfigured tiers (missing creds) are skipped at assembly.
 #   e.g. GEN_TIER_ORDER=gemini:gemma-4-31b-it,gemini:gemma-4-26b-a4b-it,nim
 #
 # Default = Gemma 4 (1500 RPD on the free tier vs 20 RPD for Gemini Flash), which
@@ -95,7 +101,7 @@ def _parse_order(raw: str | None, default: list[str]) -> list[str]:
 
 def _parse_spec(spec: str) -> tuple[str, str | None]:
     """'gemini:gemma-4-31b-it' → ('gemini', 'gemma-4-31b-it'); 'nim' → ('nim', None).
-    Split on the FIRST colon only, so ollama:llama3.2:3b keeps its model tag."""
+    Split on the FIRST colon only, so a model tag with its own colon survives."""
     spec = spec.strip()
     if ":" in spec:
         provider, model = spec.split(":", 1)
@@ -193,6 +199,7 @@ def _build_gemini(temperature: float, model: str | None = None):
         google_api_key=GOOGLE_API_KEY,
         temperature=temperature,
         safety_settings=_gemini_safety(),
+        max_retries=GEMINI_MAX_RETRIES,   # fail over to the next tier fast (see above)
         # Gemma 4 is a REASONING model — by default it streams a long hidden
         # 'thinking' block before the answer (10-30s of invisible latency, which
         # looked like hangs). thinking_level='minimal' produces zero thought
@@ -203,25 +210,12 @@ def _build_gemini(temperature: float, model: str | None = None):
     )
 
 
-def _build_ollama(temperature: float, model: str | None = None):
-    if not USE_OLLAMA:
-        return None
-    from langchain_ollama import ChatOllama
-    return ChatOllama(
-        model=model or OLLAMA_MODEL,
-        base_url=OLLAMA_HOST,
-        temperature=temperature,
-    )
-
-
 def _build_tier(provider: str, temperature: float, model: str | None = None):
-    """Build one tier from a (provider, model) spec, or None if creds/flags absent."""
+    """Build one tier from a (provider, model) spec, or None if creds absent."""
     if provider == "nim":
         return _build_nim(temperature, model=model)
     if provider == "gemini":
         return _build_gemini(temperature, model=model)
-    if provider == "ollama":
-        return _build_ollama(temperature, model=model)
     return None
 
 
@@ -249,7 +243,7 @@ def _chain(runnables: list):
     if not runnables:
         raise RuntimeError(
             "No LLM provider configured. Set GOOGLE_API_KEY and/or NVIDIA_API_KEY "
-            "(or USE_OLLAMA) in your .env, and a valid tier order."
+            "in your .env, and a valid tier order."
         )
     primary, fallbacks = runnables[0], runnables[1:]
     if not fallbacks:
@@ -303,8 +297,6 @@ def _labels_for(order: list[str]) -> list[str]:
             out.append(f"gemini:{model or GEMINI_MODEL}")
         elif provider == "nim" and NVIDIA_API_KEY:
             out.append(f"nim:{model or NIM_MODEL}")
-        elif provider == "ollama" and USE_OLLAMA:
-            out.append(f"ollama:{model or OLLAMA_MODEL}")
     return out
 
 

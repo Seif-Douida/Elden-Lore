@@ -348,11 +348,6 @@ def main() -> None:
                    help="Seconds to sleep between questions (avoids NIM rate limits, default 3)")
     args = p.parse_args()
 
-    from rich.console import Console
-    # force_terminal=False avoids the Windows legacy console encoder that
-    # chokes on non-CP1252 characters (checkmarks, dashes, etc.)
-    console = Console(force_terminal=False, highlight=False)
-
     print("Elden Path - RAG Benchmark")
     print("Initialising pipeline (LLM + embedder + Qdrant)...")
 

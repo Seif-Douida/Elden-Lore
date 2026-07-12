@@ -71,7 +71,7 @@ def point_id(chunk_id: str) -> int:
 # ── Payload projection ────────────────────────────────────────────────────────
 
 def to_payload(chunk: dict) -> dict:
-    return {
+    payload = {
         "text":            chunk["text"],
         "raw_text":        chunk["raw_text"],
         "url":             chunk["url"],
@@ -84,7 +84,12 @@ def to_payload(chunk: dict) -> dict:
         "entities":        chunk["entities"],
         "image_url":       chunk["image_url"],
         "source_type":     chunk.get("source_type", "wiki"),
+        "stats":           chunk.get("stats", {}),       # full stat card (grounding, Stats chunk)
     }
+    # Flat facets (dlc, subject, weapon_type, scaling_*, weight, fp_cost, weak_to)
+    # are spread to top-level keys so Qdrant can index + filter them.
+    payload.update(chunk.get("facets", {}))
+    return payload
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

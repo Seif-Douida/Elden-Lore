@@ -149,16 +149,36 @@ def run(recreate: bool = False, embeddings_dir: Optional[str] = None) -> None:
             # Hardening: one optimization thread = minimal concurrent-write window.
             optimizers_config=OptimizersConfigDiff(max_optimization_threads=1),
         )
-        for field, schema in [
-            ("category",   PayloadSchemaType.KEYWORD),
-            ("chunk_type", PayloadSchemaType.KEYWORD),
-            ("doc_type",   PayloadSchemaType.KEYWORD),
-            ("entities",   PayloadSchemaType.KEYWORD),
-            ("breadcrumb", PayloadSchemaType.KEYWORD),
-            ("title",      PayloadSchemaType.KEYWORD),
-        ]:
+
+    # Ensure payload indexes (idempotent). Runs whether or not the collection is
+    # new, so the structured-stats facet fields get indexed on an EXISTING
+    # collection during a delta re-scrape too.
+    indexes = [
+        ("category",    PayloadSchemaType.KEYWORD),
+        ("chunk_type",  PayloadSchemaType.KEYWORD),
+        ("doc_type",    PayloadSchemaType.KEYWORD),
+        ("entities",    PayloadSchemaType.KEYWORD),
+        ("breadcrumb",  PayloadSchemaType.KEYWORD),
+        ("title",       PayloadSchemaType.KEYWORD),
+        # ── facets (structured-stats overhaul) ──
+        ("subject",     PayloadSchemaType.KEYWORD),
+        ("weapon_type", PayloadSchemaType.KEYWORD),
+        ("dlc",         PayloadSchemaType.BOOL),
+        ("scaling_str", PayloadSchemaType.KEYWORD),
+        ("scaling_dex", PayloadSchemaType.KEYWORD),
+        ("scaling_int", PayloadSchemaType.KEYWORD),
+        ("scaling_fai", PayloadSchemaType.KEYWORD),
+        ("scaling_arc", PayloadSchemaType.KEYWORD),
+        ("weak_to",     PayloadSchemaType.KEYWORD),
+        ("weight",      PayloadSchemaType.FLOAT),
+        ("fp_cost",     PayloadSchemaType.INTEGER),
+    ]
+    for field, schema in indexes:
+        try:
             client.create_payload_index(COLLECTION_NAME, field_name=field, field_schema=schema)
-        console.print("[dim]Payload indexes created.[/dim]")
+        except Exception:
+            pass  # index already exists
+    console.print(f"[dim]Payload indexes ensured ({len(indexes)}).[/dim]")
 
     # Upsert in batches (pure I/O)
     with Progress(

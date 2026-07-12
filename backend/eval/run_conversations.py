@@ -116,7 +116,7 @@ def main() -> None:
     if args.limit:
         convos = convos[: args.limit]
 
-    console.print(f"[dim]Loading pipeline...[/dim]")
+    console.print("[dim]Loading pipeline...[/dim]")
     pipe, gen = Pipeline(), Generator()
 
     RESULTS_DIR.mkdir(exist_ok=True)

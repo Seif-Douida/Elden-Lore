@@ -49,7 +49,6 @@ class Settings(BaseSettings):
     # ── LLM providers (presence gates each fallback tier) ────────────────────
     nvidia_api_key: str | None = Field(default=None, alias="NVIDIA_API_KEY")
     google_api_key: str | None = Field(default=None, alias="GOOGLE_API_KEY")
-    use_ollama: bool = Field(default=False, alias="USE_OLLAMA")
 
     # ── Database (Supabase Postgres) ─────────────────────────────────────────
     # Use the async driver form, e.g.

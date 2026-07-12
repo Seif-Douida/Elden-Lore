@@ -55,7 +55,6 @@ async def lifespan(app: FastAPI):
 
     # ── Shutdown ─────────────────────────────────────────────────────────────
     log.info("shutting down")
-    from api.db.session import dispose_engine
     await dispose_engine()
     app.state.pipeline = None
     app.state.generator = None

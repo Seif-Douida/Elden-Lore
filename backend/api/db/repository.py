@@ -10,7 +10,7 @@ from __future__ import annotations
 import uuid
 from typing import Optional, Sequence
 
-from sqlalchemy import select, delete, update, func
+from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 

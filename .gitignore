@@ -18,14 +18,10 @@ env.*.yaml
 # Qdrant Docker named volume (lives in WSL2, not the repo)
 qdrant_storage
 
-# Data pipeline — large generated artifacts (reproducible; do not push)
-data_pipeline/data/cache
-data_pipeline/data/discovered_urls.jsonl
-data_pipeline/data/no_breadcrumb.txt
-data_pipeline/data/pages.jsonl
-data_pipeline/data/chunks.jsonl
-data_pipeline/data/*_supplement.jsonl
-data_pipeline/data/embeddings*/
+# Data pipeline — ALL generated artifacts (reproducible; distributed via Drive).
+# Blanket-ignore the whole data dir so no scrape/chunk/embed/backup/temp file can
+# slip in. Keep the folder present (but empty) via .gitkeep if you want the path.
+data_pipeline/data/
 
 # Eval — generated benchmark run outputs (reproducible)
 backend/eval/results/

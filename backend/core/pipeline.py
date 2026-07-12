@@ -19,12 +19,63 @@ the generation layer to build a prompt.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 from core.router import Router, ResolvedDecision
 from core.retriever import Retriever, RetrievedChunk
+
+# Facet whitelist — the LLM sometimes emits junk keys ('enumerate_group' inside
+# facets) or malformed ones; only these reach the retriever as hard filters.
+_FACET_KEYS = {"dlc", "weapon_type", "weak_to", "strong_vs",
+               "weight_min", "weight_max", "fp_cost_min", "fp_cost_max"}
+_SCALING_KEY = re.compile(r"^scaling_(str|dex|int|fai|arc)_(min|max)$")
+_SORT_VALUES = {"weight_desc", "weight_asc", "fp_cost_desc", "fp_cost_asc"}
+
+
+def _clean_facets(facets) -> Optional[dict]:
+    """Keep only well-formed facet keys the retriever understands. Returns None when
+    nothing valid remains (so a hallucinated facet can't empty the retrieval)."""
+    if not isinstance(facets, dict):
+        return None
+    out: dict = {}
+    for k, v in facets.items():
+        if k == "sort":
+            if isinstance(v, str) and v in _SORT_VALUES:
+                out[k] = v
+        elif k in _FACET_KEYS or _SCALING_KEY.match(k):
+            out[k] = v
+    return out or None
+
+
+# Deterministic superlative detection — the Gemma router intermittently omits the
+# sort/group for "heaviest/lightest/cheapest X", and then improvises a WRONG ranking
+# (e.g. ranking armor by Robustness, not weight). Detect the pattern in code so it's
+# reliable regardless of the LLM.
+_SUPERLATIVE_RE = re.compile(r"\b(heaviest|lightest|cheapest)\b", re.I)
+_SUPERLATIVE_CAT = [
+    (re.compile(r"\bsorcer", re.I),      "Sorceries"),
+    (re.compile(r"\bincantation", re.I), "Incantations"),
+    (re.compile(r"\barmou?r|\bhelm|\bgauntlet|\bgreaves|\bchest\b|\bleg armou?r", re.I), "Armor"),
+    (re.compile(r"\bweapon|\bsword|\bkatana|\bgreatsword|\baxe|\bspear|\bhalberd|"
+                r"\bdagger|\bhammer|\bbow|\bstaff|\bseal|\bfist|\bwhip|\breaper|"
+                r"\bflail|\btwinblade", re.I), "Weapons"),
+]
+
+
+def _detect_superlative(question: str) -> tuple[Optional[str], Optional[str]]:
+    """('weight_desc', 'Armor') for 'heaviest armor', etc. → (sort, group)."""
+    m = _SUPERLATIVE_RE.search(question or "")
+    if not m:
+        return None, None
+    word = m.group(1).lower()
+    sort = {"heaviest": "weight_desc", "lightest": "weight_asc",
+            "cheapest": "fp_cost_asc"}[word]
+    group = next((g for pat, g in _SUPERLATIVE_CAT if pat.search(question)), None)
+    return sort, group
+
 
 DEFAULT_TOP_K = 8
 # Broad questions (enumerations, questlines, lore overviews) need more context than a
@@ -103,6 +154,25 @@ class Pipeline:
         # distinctly wanted for "what does X say"); for body/item_desc the intent boost
         # already handles preference, so don't let a stray bias become a hard filter.
         chunk_type_filter = decision.chunk_type_bias if decision.chunk_type_bias == "dialogue" else None
+
+        # Relational facets: the LLM sometimes emits junk keys (e.g. put
+        # 'enumerate_group' INSIDE facets) or a valid key with a garbage value
+        # ('weapon_type': 'Dexterity scaling weapons'), which as a HARD filter matches
+        # nothing → empty context → "couldn't find anything". Whitelist the keys, then
+        # split off the superlative `sort`.
+        facets = _clean_facets(decision.facets)
+        sort = facets.pop("sort", None) if facets else None
+        facet_filter = facets or None
+
+        # Deterministic superlative override — the router intermittently omits the
+        # sort/group for "heaviest/lightest/cheapest X" and then improvises a wrong
+        # ranking (armor by Robustness, not weight). Fill in from the question text
+        # when the LLM didn't, so the pattern is reliable regardless of Gemma.
+        det_sort, det_group = _detect_superlative(question)
+        if det_sort and not sort:
+            sort = det_sort
+            notes.append(f"superlative detected → sort={det_sort} group={det_group}")
+
         common = dict(
             k=k,
             category=decision.category_hint if use_category else None,
@@ -115,43 +185,99 @@ class Pipeline:
         # Falls back to the raw question when retrieval_query is None.
         embed_query = decision.retrieval_query or question
 
-        # For enumeration, the roster is authoritative — don't let a mis-resolved
-        # CATEGORY entity (e.g. "katanas" → "Katar") narrow the descriptive
-        # retrieval; search broadly so the supporting context is on-topic.
-        entities = [] if decision.enumerate_group else decision.entity_focus
+        # enumerate_group is meant to be a CATEGORY ("Katanas"), but the router
+        # sometimes echoes the resolved item itself ("how many somber smithing stones"
+        # → enumerate_group='Somber Ancient Dragon Smithing Stone' AND entity=[same]).
+        # Enumerating a single item's own title yields nothing useful and — worse —
+        # would drop the entity below → broad search → messy walkthrough chunks. When
+        # enumerate_group just names the resolved entity, it's a lookup, not a roster.
+        enum_group = decision.enumerate_group
+        if enum_group and decision.entity_focus and any(
+            enum_group.strip().lower() == e.strip().lower() for e in decision.entity_focus
+        ):
+            enum_group = None
+            notes.append("enumerate_group == entity → treated as lookup, not enumeration")
 
-        # ── Attempt 1: hard entity filter (if any entity resolved) ───────────
+        # Drop the entity filter ONLY for real enumeration (where a mis-resolved
+        # CATEGORY entity like "katanas"→"Katar" would wrongly narrow). For a facet
+        # query with a SPECIFIC resolved entity ("stats of the Moonveil" + a spurious
+        # weapon_type facet), keep the entity — a named entity beats a hallucinated facet.
+        entities = [] if enum_group else list(decision.entity_focus)
+
+        # "I am in X, how do I reach Y?" — the router often resolves the ORIGIN (X)
+        # as the entity and hard-filters retrieval to it, burying the destination Y.
+        # The rewritten query frames X as an origin ("… from X"), so drop any entity
+        # that appears only as a "from <entity>" origin — let the query drive to Y.
+        rq_low = (decision.retrieval_query or "").lower()
+        if entities and "from " in rq_low:
+            kept = [e for e in entities if f"from {e.lower()}" not in rq_low
+                    and f"from the {e.lower()}" not in rq_low]
+            if kept != entities:
+                notes.append(f"dropped origin entity from filter (was {entities}, now {kept})")
+                entities = kept
+
+        # ── Retrieval with graceful fallback ─────────────────────────────────
         entity_fallback = False
-        chunks: list[RetrievedChunk] = []
         _tr = time.perf_counter()
         if entities:
-            chunks = self._retriever.retrieve(
-                embed_query, entities=entities, **common
-            )
+            # A specific named entity IS the precision signal — retrieve its own
+            # chunks and do NOT also hard-filter by facet. A stray facet ('how many
+            # somber stones in the DLC' → dlc=True) would exclude the entity's own
+            # page (the smithing-stone item's DLC-locations chunk isn't dlc-tagged)
+            # and surface tangential DLC walkthroughs instead. The facet still drives
+            # the ROSTER below; here the entity wins.
+            chunks = self._retriever.retrieve(embed_query, entities=entities, **common)
             if not chunks:
-                # ── Fallback: drop the entity filter, keep intent/boosts ─────
                 entity_fallback = True
-                notes.append(
-                    f"entity filter {entities} returned empty → "
-                    "fell back to no-entity search (check entity casing/coverage)"
-                )
-                chunks = self._retriever.retrieve(embed_query, **common)
+                notes.append(f"entity filter {entities} empty → no-entity search")
+                chunks = self._retriever.retrieve(embed_query, facets=facet_filter, **common)
         else:
-            chunks = self._retriever.retrieve(embed_query, **common)
+            chunks = self._retriever.retrieve(embed_query, facets=facet_filter, **common)
+            # A facet that matched nothing (bad LLM value) shouldn't leave the answer
+            # context-less — the roster is authoritative for the LIST anyway.
+            if not chunks and facet_filter:
+                notes.append(f"facet {facet_filter} empty → no-facet search")
+                chunks = self._retriever.retrieve(embed_query, **common)
         timings["retrieval_ms"] = int((time.perf_counter() - _tr) * 1000)
 
-        # Enumeration: for "how many / list all X", get the precise roster from
+        # Enumeration / relational / superlative: build a precise roster from
         # metadata (the vector chunks above still provide descriptions). Empty →
         # ignore and fall back to the normal answer.
         roster: list[str] = []
-        if decision.enumerate_group:
-            roster = self._retriever.enumerate_titles(
-                decision.enumerate_group, category=decision.category_hint
+        # The deterministic detector's category ('Armor', 'Weapons', 'Sorceries')
+        # maps to a REAL breadcrumb; the router's free-text enumerate_group is often
+        # bogus ('Armor Sets', 'Dexterity scaling weapons') and matches nothing. So
+        # for a superlative, trust the detector; otherwise use enumerate_group.
+        group = det_group or enum_group
+        if sort:
+            # Superlative: "heaviest armor" → sort='weight_desc'. Rank by the facet.
+            facet_name, direction = sort.rsplit("_", 1)
+            ranked = self._retriever.top_by_facet(
+                facet_name, group=group,
+                category=None if group else decision.category_hint,
+                facets=facet_filter, desc=(direction != "asc"),
             )
-            if not roster:  # category_hint may be wrong/too strict — retry without it
-                roster = self._retriever.enumerate_titles(decision.enumerate_group)
+            if not ranked and group:  # bad/absent group → rank across the category
+                ranked = self._retriever.top_by_facet(
+                    facet_name, group=None, category=decision.category_hint,
+                    facets=facet_filter, desc=(direction != "asc"),
+                )
+                if ranked:
+                    notes.append(f"top_by_facet group={group} empty → category-wide")
+            roster = [f"{t} ({v})" for t, v in ranked]
             if roster:
-                notes.append(f"enumerate '{decision.enumerate_group}' → {len(roster)} titles")
+                notes.append(f"top_by_facet {sort} (group={group}) → {len(roster)}")
+        elif group or (facet_filter and not decision.entity_focus):
+            # A facet-only roster makes sense for a category question ("dexterity
+            # weapons"), but NOT when a specific item is the focus — there, the facet
+            # (e.g. dlc=True) would enumerate every DLC item as noise. Entity wins.
+            roster = self._retriever.enumerate_titles(
+                group, category=decision.category_hint, facets=facet_filter
+            )
+            if not roster:  # category_hint may over-constrain — retry without it
+                roster = self._retriever.enumerate_titles(group, facets=facet_filter)
+            if roster:
+                notes.append(f"enumerate group={group} facets={facet_filter} → {len(roster)} titles")
 
         return PipelineResult(
             question=question,

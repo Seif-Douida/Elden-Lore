@@ -244,16 +244,24 @@ Answer the player's question using ONLY the information in the provided context 
 passages. Rules:
 - Ground every factual claim in the context. Do not invent items, locations, \
 stats, or steps that aren't supported there.
-- If the context doesn't contain the answer, say so plainly and suggest what the \
-player might ask instead — don't guess.
+- If the answer genuinely isn't available, say so IN-WORLD by naming the missing \
+thing — e.g. "The wiki doesn't note a recommended level for Radahn" — then suggest \
+what the player might ask instead; don't guess. NEVER phrase this as "the provided \
+information/records/context does not specify/state/contain…" (see the source-material \
+rule below), and never open with such a disclaimer before an answer you CAN give.
 - Be well-organized and concise. Use short paragraphs or tight lists for steps, \
 drops, or locations.
-- ENUMERATION: when the context includes a "COMPLETE LIST" block (a category total \
-plus example items), state the EXACT total count and list the given examples. If the \
-total exceeds the examples shown, tell the player they can see the full list on the \
-linked wiki page or ask about a specific item. Never invent items to pad a list, and \
-never dump a huge list. (e.g. "There are 108 talismans; notable ones include … — want \
-details on a specific one, or the full list on the wiki?")
+- ENUMERATION & RANKED LISTS: when the context includes a "COMPLETE LIST" or "RANKED \
+LIST" block, THAT block is the authoritative answer — use it (not the reference \
+passages) for the count, the list, or the ranking, and never say the answer "isn't \
+specified" when the block supplies it. For a COMPLETE LIST: state the EXACT total and \
+list ~15 examples; if the total exceeds what's shown, point the player to the wiki or \
+invite them to ask about a specific item (never dump a huge list, never invent items \
+to pad it). (e.g. "There are 108 talismans; notable ones include … — want the full \
+list on the wiki?") For a RANKED LIST (best first): the FIRST entry is the answer to a \
+superlative ("heaviest/lightest/cheapest/strongest") — name it with its value, then a \
+few runners-up (e.g. "The heaviest armor is the Leyndell Knight Set at 28.1, followed \
+by Bull-Goat Armor (26.5)…").
 - COUNTING FROM A LIST: if the player asks "how many" and there is no explicit total \
 in the context, but the context DOES lay out the specific instances or locations (e.g. \
 a "Where to Find" list of spots where an item is found), count those and give the \
@@ -275,6 +283,17 @@ that they haven't asked a question.
 numbers (e.g. never write "[1]", "passage [2]", "according to context [3]", \
 "the context passage you're referring to is [N]", or any similar phrasing). \
 The interface shows sources as separate cards — never mention them in your text.
+- NEVER refer to your source material, in ANY wording. This bans "the provided \
+context/text/information/records/data", "the documentation", "the context", "the \
+available information", "the wiki does not provide/specify a ranked list", and every \
+close variant — ESPECIALLY the pattern "the provided … does not specify / state / \
+contain / mention …". The player only sees your answer, so these read as robotic. \
+Lead with what IS known, stated as settled fact. Only flag a gap when the player \
+asked for a specific detail that is genuinely absent, and then name the missing \
+THING in-world — "The wiki doesn't note a recommended level for Radahn", "I don't \
+have the exact number, but the known locations are…" — never by pointing at \
+"information / records / context" as a source, and never as a lead-in before an \
+answer you can actually give.
 - Do NOT write image placeholders, image captions, or any phrase about where \
 an image appears (e.g. never write "[Image of X appears here]", \
 "[image appears here]", "see image below", etc.). The interface handles image \
@@ -334,11 +353,18 @@ CRYPTIC_SYSTEM = CRYPTIC_RESTRAINED
 # ── Message assembly ──────────────────────────────────────────────────────────
 
 def format_roster(group: str, titles: list[str], max_show: int = 15) -> str:
-    """A precise category roster (from Qdrant metadata) for enumeration questions:
-    the EXACT total count + a capped sample. Lets the model state the count, list a
-    few, and point to the wiki — instead of hallucinating or dumping a huge list."""
+    """A precise roster (from Qdrant metadata) for enumeration / relational / ranked
+    questions: the authoritative answer set the model must use instead of deriving a
+    list from the passages (or hallucinating). Entries like "Bull-Goat Armor (26.5)"
+    mark a RANKED list (superlatives), where the first entry is the answer."""
+    import re
     n = len(titles)
     shown = titles[:max_show]
+    ranked = any(re.search(r"\([\d.]+\)\s*$", t) for t in shown)
+    if ranked:
+        return (f"RANKED LIST — {group}, best first ({n} total). The FIRST entry is "
+                f"the answer to a 'most/least/-est' question. Top {len(shown)}: "
+                f"{'; '.join(shown)}.")
     return (f"COMPLETE LIST — {group}: {n} total. "
             f"Examples ({len(shown)} of {n}): {', '.join(shown)}.")
 
@@ -371,8 +397,8 @@ def build_messages(
     human_parts = []
     if history:
         human_parts.append(f"Recent conversation:\n{history}\n")
-    if roster and enumerate_group:
-        human_parts.append(format_roster(enumerate_group, roster) + "\n")
+    if roster:
+        human_parts.append(format_roster(enumerate_group or "Matching results", roster) + "\n")
     human_parts.append(f"Wiki reference material:\n{context}\n")
     human_parts.append(f"Player's question: {question}")
     human = "\n".join(human_parts)

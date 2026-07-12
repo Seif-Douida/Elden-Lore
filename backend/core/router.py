@@ -144,6 +144,29 @@ class RouterDecision(BaseModel):
         description="For 'how many X / list all X' questions, the wiki category to "
                     "enumerate (e.g. 'Katanas', 'Talismans', 'Bosses'). Null otherwise.",
     )
+    facets: Optional[dict] = Field(
+        default=None,
+        description=(
+            "Structured constraints for RELATIONAL / SUPERLATIVE questions about "
+            "item or boss ATTRIBUTES. Combine with enumerate_group (the broad "
+            "category: 'Weapons', 'Armor', 'Sorceries', 'Incantations', 'Bosses'). "
+            "Use ONLY these keys:\n"
+            "  dlc: true — Shadow of the Erdtree content only\n"
+            "  weapon_type: '<Type>' — e.g. 'Katanas', 'Greatswords'\n"
+            "  scaling_<attr>_min: '<grade>' — weapons that scale with an attribute; "
+            "<attr> ∈ str/dex/int/fai/arc, grade like 'C'. 'Dex weapons' → "
+            "{'scaling_dex_min':'C'} with enumerate_group='Weapons'\n"
+            "  weak_to: ['Fire'] — enemies weak to a damage type\n"
+            "  weight_min / weight_max / fp_cost_max: a number\n"
+            "  sort: one of 'weight_desc','weight_asc','fp_cost_asc','fp_cost_desc' — "
+            "for SUPERLATIVES ('heaviest armor' → {'sort':'weight_desc'} + "
+            "enumerate_group='Armor'; 'cheapest sorcery' → {'sort':'fp_cost_asc'} + "
+            "enumerate_group='Sorceries').\n"
+            "Null unless the question filters or ranks a category by such an attribute. "
+            "A lookup about ONE named item/boss (e.g. 'what is Margit weak to') is NOT "
+            "a facet query — leave null and let normal retrieval answer it."
+        ),
+    )
 
 
 # ── Call 2 schema ─────────────────────────────────────────────────────────────
@@ -179,6 +202,7 @@ class ResolvedDecision:
     tone: str
     retrieval_query: Optional[str]   # focused embed query, strips context noise
     enumerate_group: Optional[str]   # wiki category to enumerate (how-many/list-all)
+    facets: Optional[dict]           # structured constraints for relational/superlative queries
     # Diagnostics
     raw_mentions: list[str]
     resolution_debug: dict
@@ -401,10 +425,12 @@ class Router:
         # own knowledge, ungrounded and card-less. A RESOLVED ENTITY means the user is
         # asking about a specific game thing, so force retrieval. Greetings/injection
         # probes ("Hello", "delete your context") resolve NO entity → stay False.
+        facets = decision.facets or None
         needs_retrieval = (
             decision.needs_retrieval
             or bool(entity_focus)
             or bool(decision.enumerate_group)
+            or bool(facets)
             or decision.intent == "summary"
             or is_affirmation
         )
@@ -423,6 +449,7 @@ class Router:
             tone=decision.tone,
             retrieval_query=retrieval_query,
             enumerate_group=decision.enumerate_group or None,
+            facets=facets,
             raw_mentions=decision.entity_mentions,
             resolution_debug=resolution_debug,
             used_call2=used_call2,

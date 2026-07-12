@@ -23,7 +23,6 @@ dependencies = [
     "torch>=2.5",                # CUDA build on Win/Linux via [tool.uv.sources] below
     "langchain-nvidia-ai-endpoints>=0.3",
     "langchain-google-genai>=2.0",
-    "langchain-ollama>=0.2",
     "rapidfuzz>=3.10",
     "jellyfish>=1.1",
     # --- Vector DB ---
